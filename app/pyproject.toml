@@ -1,0 +1,23 @@
+[project]
+name = "opennvr-app-fall-detection"
+version = "1.0.0"
+description = "OpenNVR Fall Detection Monitoring App (Detector archetype, persistent fall rule)"
+requires-python = ">=3.11"
+license = { text = "AGPL-3.0" }
+dependencies = [
+    "opennvr-app-sdk",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+fall-detection = "fall_detection:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"

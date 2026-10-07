@@ -1,0 +1,25 @@
+[project]
+name = "opennvr-adapter-fall-detection"
+version = "1.0.0"
+description = "OpenNVR Fall Detection AI Adapter (YOLO Pose + Fall Transformer)"
+requires-python = ">=3.11"
+license = { text = "AGPL-3.0" }
+dependencies = [
+    "opennvr-adapter-sdk",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "pydantic>=2.8.0",
+    "numpy>=1.26.0",
+    "opencv-python-headless>=4.10.0",
+    "onnxruntime-gpu>=1.20.0",
+    "websockets>=13.0",
+]
+
+[project.optional-dependencies]
+cpu = [
+    "onnxruntime>=1.20.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,24 @@
+# Fall Detection App config for OpenNVR docker compose stack.
+
+nats_url: "nats://nats:4222"
+nats_token: "${INTERNAL_API_KEY}"
+
+subject_pattern: "opennvr.inference.>"
+consume_tier0: false
+
+fallen_seconds: 3.0
+alert_cooldown_seconds: 30.0
+alert_severity: "critical"
+track_ttl_seconds: 10.0
+attach_snapshot: true
+active_hours: null
+
+webhook_url: null
+nats_alerts_url: "nats://nats:4222"
+nats_alerts_token: "${INTERNAL_API_KEY}"
+
+# Contract server (:9210) & auto-registration with OpenNVR Core
+contract_port: 9210
+contract_bind_host: "0.0.0.0"
+contract_host: "fall-detection"
+opennvr_url: "http://opennvr-core:8000"

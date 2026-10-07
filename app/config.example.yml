@@ -1,0 +1,46 @@
+# Copyright (c) 2026 OpenNVR
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Fall Detection App — Example configuration.
+
+# ── NATS endpoint (KAI-C event bus) ──────────────────────────────
+nats_url: "nats://nats:4222"
+nats_token: null
+
+# Subscribe to inference events from the fall detection adapter
+subject_pattern: "opennvr.inference.>"
+consume_tier0: false
+
+# ── Fall Detection Rules ──────────────────────────────────────────
+# How long a person must remain down before alert triggers (seconds)
+fallen_seconds: 3.0
+
+# Minimum gap between alerts for the same camera
+alert_cooldown_seconds: 30.0
+
+# Severity of the alert (low / medium / high / critical)
+alert_severity: "critical"
+
+# Track TTL before person is considered out of view
+track_ttl_seconds: 10.0
+
+# Capture still snapshot on alert
+attach_snapshot: true
+
+# Active hours for alerts (null = 24/7)
+active_hours: null
+# active_hours: {start: "08:00", end: "20:00"}
+
+# ── Alert delivery ────────────────────────────────────────────────
+webhook_url: null
+nats_alerts_url: null
+nats_alerts_token: null
+
+# ── Cameras ───────────────────────────────────────────────────────
+# Fall detection monitors the entire camera field of view.
+# When connected to OpenNVR Core, cameras are picked dynamically in the App Catalog.
+# For standalone testing, list the cameras here:
+cameras:
+  - camera_id: "cam1"
+  - camera_id: "cam-corridor"
+      - [0, 1080]
