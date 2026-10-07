@@ -1,0 +1,6 @@
+spaces
+gradio
+opencv-python-headless
+ultralytics
+numpy
+ai-edge-litert
