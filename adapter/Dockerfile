@@ -31,7 +31,7 @@ RUN pip install --no-cache-dir \
         numpy==1.26.4 \
         opencv-python-headless==4.10.0.84 \
         torch==2.5.1 \
-        ultralytics==8.3.82 \
+        ultralytics>=8.4.0 \
         ai-edge-litert==1.2.0
 
 # Install OpenNVR Adapter SDK
@@ -40,7 +40,7 @@ RUN pip install --no-cache-dir ./opennvr_adapter_sdk
 
 # Copy adapter source into adapters.fall_detection package
 RUN mkdir -p ./adapters/fall_detection && touch ./adapters/__init__.py
-COPY coco_keypoints.py fall_transformer.py main.py service.py __init__.py ./adapters/fall_detection/
+COPY coco_keypoints.py fall_transformer.py fall_detection_core.py main.py service.py __init__.py ./adapters/fall_detection/
 
 ENV PYTHONPATH=/app \
     OPENNVR_ADAPTER_TOKEN="" \

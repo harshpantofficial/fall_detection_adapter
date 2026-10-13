@@ -303,6 +303,37 @@ class FallDetectionDetector(Detector):
         self._contract_note_alerts(len(fired))
         return fired
 
+    def on_cameras_update(self, camera_ids) -> None:
+        super().on_cameras_update(camera_ids)
+        for cid in camera_ids:
+            cid_str = f"cam{cid}" if str(cid).isdigit() else str(cid)
+            if cid_str not in self.cfg.cameras:
+                self.cfg.cameras[cid_str] = CameraWatch(camera_id=cid_str)
+            if str(cid) not in self.cfg.cameras:
+                self.cfg.cameras[str(cid)] = CameraWatch(camera_id=str(cid))
+        logger.info("Cameras updated: %s (now watching: %s)", camera_ids, list(self.cfg.cameras.keys()))
+
+    def on_config_update(self, config: dict[str, Any]) -> None:
+        """Apply OpenNVR catalog configuration updates live."""
+        if "fallen_seconds" in config:
+            try:
+                self.cfg.fallen_seconds = float(config["fallen_seconds"])
+            except (ValueError, TypeError):
+                pass
+        if "alert_severity" in config:
+            self.cfg.alert_severity = str(config["alert_severity"]).lower()
+        if "alert_cooldown_seconds" in config:
+            try:
+                self.cfg.alert_cooldown_seconds = float(config["alert_cooldown_seconds"])
+            except (ValueError, TypeError):
+                pass
+        if "track_ttl_seconds" in config:
+            try:
+                self.cfg.track_ttl_seconds = float(config["track_ttl_seconds"])
+            except (ValueError, TypeError):
+                pass
+        logger.info("FallDetection configuration updated live: %s", config)
+
     def on_detections(
         self,
         camera_id: str,
@@ -311,7 +342,8 @@ class FallDetectionDetector(Detector):
     ) -> list[Alert]:
         cam = self.cfg.cameras.get(camera_id)
         if cam is None:
-            return []
+            cam = CameraWatch(camera_id=str(camera_id))
+            self.cfg.cameras[str(camera_id)] = cam
 
         now = time.time()
         event_ts = self.parse_event_ts(event.get("completed_at"))
@@ -396,8 +428,8 @@ class FallDetectionDetector(Detector):
         for key, rec in list(self._persons.items()):
             cam = self.cfg.cameras.get(key[0])
             if cam is None:
-                self._persons.pop(key)
-                continue
+                cam = CameraWatch(camera_id=str(key[0]))
+                self.cfg.cameras[str(key[0])] = cam
 
             d = rec.data
             # Person left view

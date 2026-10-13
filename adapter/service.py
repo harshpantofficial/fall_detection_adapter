@@ -145,6 +145,13 @@ class FallDetectionService(AdapterService):
             self._device = "cuda" if torch.cuda.is_available() else "cpu"
             self._gpu_in_use = (self._device == "cuda")
 
+            try:
+                import ultralytics.nn.modules.head as yolo_head
+                if not hasattr(yolo_head, "Pose26") and hasattr(yolo_head, "Pose"):
+                    yolo_head.Pose26 = yolo_head.Pose
+            except Exception:
+                pass
+
             logger.info("Loading YOLO26 pose model from %s on %s...", self._weights_path, self._device)
             self._yolo = YOLO(self._weights_path)
 
@@ -187,7 +194,7 @@ class FallDetectionService(AdapterService):
             framework=MODEL_FRAMEWORK,
             size_mb=self._weights_size_mb(),
             modalities_in=["image"],
-            modalities_out=["keypoints", "persons", "fall_state"],
+            modalities_out=["keypoints", "persons", "detections", "fall_state"],
             fingerprint=self.fingerprint(),
         )
 
@@ -488,11 +495,34 @@ class FallDetectionService(AdapterService):
         except Exception:
             pass
 
+        # Build OpenNVR Contract §5.1 detections for UI overlays and KAI-C
+        detections = []
+        for p in persons:
+            box = p["bbox"]
+            label = "fall" if p.get("fall_state") == "fallen" else "person"
+            conf_val = p.get("confidence", p.get("score", 0.0))
+            detections.append({
+                "label": label,
+                "confidence": conf_val,
+                "bbox": {
+                    "x": round(float(box[0]) / max(1, width), 4),
+                    "y": round(float(box[1]) / max(1, height), 4),
+                    "w": round(float(box[2] - box[0]) / max(1, width), 4),
+                    "h": round(float(box[3] - box[1]) / max(1, height), 4),
+                },
+                "track_id": p.get("track_id"),
+                "fall_state": p.get("fall_state", "standing"),
+                "torso_angle_deg": p.get("torso_angle_deg", 0.0),
+                "fall_confidence": p.get("fall_confidence", 0.0),
+            })
+        
+        
         return InferResponse(
             model_name=MODEL_NAME,
             model_version=self._adapter_model_version(),
             inference_ms=inference_ms,
             result={
+                "detections": detections,
                 "persons": persons,
                 "fall_detected": fall_detected,
                 "fall_confidence": fall_conf,
