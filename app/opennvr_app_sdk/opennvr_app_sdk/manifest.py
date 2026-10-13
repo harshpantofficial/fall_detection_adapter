@@ -1,0 +1,486 @@
+# Copyright (c) 2026 OpenNVR
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+App manifests — the declarative block every app ships (App SDK spec §03/§05).
+
+The manifest is load-bearing three ways:
+
+* the future ``GET /manifest`` contract endpoint returns
+  ``manifest.to_dict()`` so the catalog can render a card + config
+  form without app-specific code;
+* ``PUT /apps/{id}/config`` validates operator config against
+  ``params`` without app-specific code;
+* ``requires_tasks`` is checked against ``GET /api/v1/adapters`` so
+  the catalog can grey out apps whose model prerequisites aren't met.
+
+Param ``type`` accepts either a Python type (``float``, ``list``, …)
+or a string for UI-schema types the catalog renders specially
+(``"geometry.polygon"`` becomes a zone editor on a camera still).
+"""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+
+def _type_name(t: Any) -> str:
+    """Render a Param type for the wire: Python types by name
+    (``float`` → ``"float"``), strings pass through
+    (``"geometry.polygon"``)."""
+    if isinstance(t, type):
+        return t.__name__
+    return str(t)
+
+
+#: Manifest ``pricing`` values the catalog understands.
+#: The detection-label vocabulary the platform's Tier-0 detector and the
+#: stock object-detection adapters emit (COCO-80). Apps that take a
+#: ``watch_labels`` list offer these as suggestions; operators can still
+#: type any label a custom model advertises.
+DETECTION_LABELS: tuple[str, ...] = (
+    "person", "bicycle", "car", "motorcycle", "bus", "truck", "boat", "train",
+    "airplane", "traffic light", "fire hydrant", "stop sign", "bench",
+    "backpack", "umbrella", "handbag", "suitcase", "dog", "cat", "bird",
+    "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe",
+    "bottle", "cup", "knife", "laptop", "cell phone", "chair", "couch",
+    "potted plant", "bed", "dining table", "tv", "book", "clock",
+)
+
+PRICING_MODELS = frozenset({"free", "paid", "subscription", "contact"})
+#: Manifest ``entitlement`` values: how enabling is gated.
+ENTITLEMENT_MODES = frozenset({"none", "license_key"})
+
+@dataclass
+class Param:
+    """One typed, declarative config knob.
+
+    ``per_camera=True`` marks params the catalog collects per camera
+    (zones, tripwires) rather than once per app."""
+
+    name: str
+    type: Any
+    default: Any = None
+    per_camera: bool = False
+    description: str = ""
+    # Required params have no usable default; the future PUT /config
+    # validator and the catalog form both need the distinction.
+    required: bool = False
+    # Values the catalog offers as one-click chips for a ``list`` (or
+    # ``str``) param — a detection-label vocabulary, plate formats, …
+    # Advisory: the operator may still type anything.
+    suggestions: list[str] = field(default_factory=list)
+    #: What to CALL this in the form. Without it the catalog has nothing
+    #: to show but the wire name, so an operator configures a system
+    #: through ``no_scan_engaged`` and ``led_window_s``. Optional, and
+    #: the form falls back to the name, so apps adopt it one at a time.
+    label: str = ""
+    #: Heading to file this under in the form. Params with no group, or
+    #: an unrecognised one, keep their declared order at the top.
+    group: str = ""
+    #: Real but rarely touched. The form collapses these behind a
+    #: disclosure so the handful that matter are not buried among
+    #: sixteen that do not — a knob nobody should turn is still worth
+    #: reaching, which is why this hides it rather than dropping it.
+    advanced: bool = False
+    #: A closed set of values, as ``(value, label)`` pairs or bare
+    #: values. Turns a number nobody can interpret into the decision it
+    #: actually encodes: ``order_weight`` 0 / 0.3 / 1.0 is really
+    #: "doesn't count / counts a little / counts fully". The server
+    #: rejects anything outside the set.
+    choices: list[Any] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        out = {
+            "name": self.name,
+            "required": self.required,
+            "type": _type_name(self.type),
+            "default": self.default,
+            "per_camera": self.per_camera,
+            "description": self.description,
+        }
+        if self.suggestions:
+            out["suggestions"] = [str(s) for s in self.suggestions]
+        if self.label:
+            out["label"] = self.label
+        if self.group:
+            out["group"] = self.group
+        if self.advanced:
+            out["advanced"] = True
+        if self.choices:
+            out["choices"] = [_choice(c) for c in self.choices]
+        return out
+
+
+def _choice(entry: Any) -> dict[str, Any]:
+    """One option, as ``{value, label}``.
+
+    Accepts ``(value, label)`` or a bare value that labels itself, so
+    the common case stays short and the readable case stays possible.
+    """
+    if isinstance(entry, dict) and "value" in entry:
+        return {"value": entry["value"],
+                "label": str(entry.get("label", entry["value"]))}
+    if isinstance(entry, (tuple, list)) and len(entry) == 2:
+        return {"value": entry[0], "label": str(entry[1])}
+    return {"value": entry, "label": str(entry)}
+
+
+@dataclass
+class AlertType:
+    """One alert kind the app can emit — drives catalog documentation
+    and downstream routing defaults."""
+
+    name: str
+    severity: str = "medium"  # low / medium / high / critical
+    description: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class StateView:
+    """One declarative view over the app's ``GET /state`` payload.
+
+    The catalog renders these with ZERO app-specific UI code — the same
+    bet as ``params`` → config form. An app that exposes richer live
+    state (occupancy per zone, plates deduped, tracks active) declares
+    how to show it instead of shipping a frontend:
+
+    ``kind="metric"``
+        A single scalar at ``path`` rendered as a stat chip
+        (e.g. ``path="denylist_size"`` → "Denylist · 4").
+    ``kind="table"``
+        A list at ``path``; ``columns`` names the keys to show when the
+        rows are dicts. A list of scalars renders as one column.
+    ``kind="gauge"``
+        A numeric ``path`` rendered as a horizontal bar between ``min``
+        and ``max``, coloured amber past ``warn`` and red past
+        ``danger`` (e.g. zone occupancy). A dict-of-numbers renders one
+        gauge per key (per camera / per zone).
+    ``kind="log"``
+        A recent-events feed: ``path`` is a list of strings or dicts
+        ``{message, time, level}``; newest ``limit`` shown first.
+    ``kind="gallery"``
+        A thumbnail wall: ``path`` is a list of dicts
+        ``{image|url, label, time}`` — for plate crops, package or
+        doorbell snapshots. ``image`` may be a ``data:`` URI.
+
+    ``path`` is a dot-path into the ``/state`` dict (``"zones"``,
+    ``"counters.in"``). A missing path renders as an em-dash, never an
+    error — ``/state`` is live data and may not have filled in yet.
+    """
+
+    name: str
+    label: str
+    kind: str = "metric"  # metric | table | gauge | log | gallery
+    path: str = ""
+    columns: list[str] = field(default_factory=list)
+    description: str = ""
+    # gauge bounds/thresholds (ignored by other kinds)
+    min: float | None = None
+    max: float | None = None
+    unit: str = ""
+    warn: float | None = None
+    danger: float | None = None
+    # log / gallery: how many recent entries to show
+    limit: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        # Drop unset optionals so manifests stay lean and the frontend's
+        # `?? default` fallbacks apply cleanly.
+        d = asdict(self)
+        for k in ("min", "max", "warn", "danger", "limit"):
+            if d.get(k) is None:
+                d.pop(k, None)
+        if not d.get("unit"):
+            d.pop("unit", None)
+        return d
+
+
+@dataclass
+class Action:
+    """One operator-invokable action on the app's contract surface.
+
+    Declared like params, rendered like params: the catalog builds a
+    generic form from ``params`` and POSTs it to
+    ``/actions/{name}`` on the app — proxied through the server's
+    ``POST /api/v1/apps/{id}/actions/{name}``, which is **user-JWT
+    only**. The governance boundary is deliberate: actions are operator
+    verbs (search footage, enroll a face); the OpenNVR Agent's service
+    key can read state but can NEVER invoke an action.
+
+    ``confirm=True`` makes the catalog ask before invoking (for actions
+    with side effects). The app implements the verb by overriding
+    :meth:`ContractMixin.on_action`.
+    """
+
+    name: str
+    label: str
+    params: list[Param] = field(default_factory=list)
+    description: str = ""
+    confirm: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "label": self.label,
+            "params": [p.to_dict() for p in self.params],
+            "description": self.description,
+            "confirm": self.confirm,
+        }
+
+
+#: Platforms an app may declare an entity on (HA-114). Unknown platforms
+#: are skipped by core, never an error, so newer ones can be added later.
+ENTITY_PLATFORMS = ("sensor", "binary_sensor", "button", "switch", "select",
+                    "number", "event")
+#: Platforms that DO something, and therefore need ``action``.
+ENTITY_CONTROL_PLATFORMS = ("button", "switch", "select", "number")
+
+
+@dataclass
+class Entity:
+    """One entity the app wants in Home Assistant (and MQTT discovery).
+
+    Core turns it into an entity descriptor, resolves its value from the
+    app's ``/state`` and pushes changes; the Home Assistant integration
+    renders it with no app-specific code.
+
+    ``state_path`` is a dot path into ``/state`` (like ``StateView.path``),
+    with list indexes and ``[field=value]`` row selectors. With
+    ``per_camera=True`` there is one entity per camera the app was given,
+    on that camera's device, and ``{camera}`` in the path becomes the
+    camera's handle (``cam3``): ``per_camera[camera={camera}].unattended``.
+
+    Controls (button, switch, select, number) name one of the app's own
+    declared ``actions``; core calls it with ``camera`` (per-camera) and
+    ``value`` (switch/select/number) when the action declares those params.
+    """
+
+    key: str
+    platform: str
+    name: str
+    state_path: str = ""
+    per_camera: bool = False
+    action: str = ""
+    device_class: str = ""
+    unit: str = ""
+    state_class: str = ""
+    icon: str = ""
+    entity_category: str = ""
+    enabled_default: bool = True
+    #: select: the choices; number: {"min", "max", "step"}.
+    options: Any = None
+    #: event platform: the event types it can fire.
+    event_types: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"key": self.key, "platform": self.platform, "name": self.name,
+                             "per_camera": bool(self.per_camera),
+                             "enabled_default": bool(self.enabled_default)}
+        for k in ("state_path", "action", "device_class", "unit", "state_class",
+                  "icon", "entity_category"):
+            if getattr(self, k):
+                d[k] = getattr(self, k)
+        if self.options is not None:
+            d["options"] = self.options
+        if self.event_types:
+            d["event_types"] = list(self.event_types)
+        return d
+
+
+@dataclass
+class AppManifest:
+    """The static identity + schema of one app.
+
+    ``subscribes`` is the NATS subject pattern for InferenceSubscriber
+    apps (``None`` for FrameApps that drive inference themselves).
+    ``requires_tasks`` names adapter task types the app depends on,
+    e.g. ``["object_detection"]``. ``requires_adapters`` (RFC-0002
+    Phase 3, decision 7) names the specific KAI-C adapters that must be
+    PROVISIONED with the app — the installer ups them alongside the app
+    and refcounts them across apps on uninstall. Adapters the standard
+    stack already ships (yolov8) are reused, not listed.
+    """
+
+    id: str
+    name: str
+    version: str
+    category: str
+    summary: str = ""
+    requires_tasks: list[str] = field(default_factory=list)
+    # Tasks this app USES when the box has them and runs without when it
+    # does not (a captioner, an embedder, a VQA model). Skills follow
+    # apps: picking a camera for this app puts these — and
+    # requires_tasks — in that camera's skill set, which is what switches
+    # the platform's enrichers on for it. requires_tasks are refused at
+    # install when absent; enrich_tasks never are.
+    enrich_tasks: list[str] = field(default_factory=list)
+    requires_adapters: list[str] = field(default_factory=list)
+    # RFC-0002 Phase 5: event scopes this app requests, e.g.
+    # ["events:plate.recognized"]. Scopes name DOMAIN events (the
+    # opennvr.events.* tree, docs/EVENT_CONTRACTS.md) — plate reads are
+    # PII (decision 6), so consuming them is a declared, granted,
+    # audited capability, visible in the App Catalog. Registration
+    # auto-grants and audits each scope today; bus-side enforcement
+    # (per-app NATS users whose subscribe permissions ARE the grants)
+    # is the staged follow-up recorded in the RFC.
+    requires_scopes: list[str] = field(default_factory=list)
+    # Vertical capabilities this app PROVIDES to the platform UI —
+    # e.g. ["vehicles"], ["occupancy"]. A first-class page in the main
+    # product lights up when any enabled app provides its capability,
+    # so a community-built replacement app declaring the same
+    # capability lights the same page (three-tier model: few curated
+    # pages, capability-keyed; everything else generic).
+    provides: list[str] = field(default_factory=list)
+    subscribes: str | None = None
+    params: list[Param] = field(default_factory=list)
+    emits: list[AlertType] = field(default_factory=list)
+    # Declarative live-state views (optional) — how the catalog renders
+    # this app's GET /state payload. Empty ⇒ the catalog shows raw
+    # state JSON as before.
+    state_schema: list[StateView] = field(default_factory=list)
+    # Declares that this app publishes overlay.boxes.v1 (boxes to draw
+    # over the live video). Informational: the catalog shows an Overlay
+    # switch for apps that declare it. The switch, not the flag, decides
+    # whether anything is drawn — that is the operator's, per app.
+    overlay: bool = False
+    # Does this app work on cameras an operator picks for it? True for
+    # nearly every app: the catalog shows a Cameras section, core serves
+    # the app only its picks, and the SDK's Detector drops events from
+    # cameras that weren't picked. False for apps that read no camera
+    # data at all — they act on OTHER apps' alerts (a notifier, a gate
+    # relay), which are already limited to the cameras those apps picked.
+    camera_picker: bool = True
+    # True ⇒ the app runs on EVERY live camera and takes no pick: the
+    # platform holds a pick for it on each camera (written on
+    # registration and on camera creation, released with the camera), so
+    # its skills ride the same table and the same enable/disable rules as
+    # everyone else's. Only meaningful with camera_picker=False. The agent
+    # declares it; an app that reads a camera's stream should not.
+    all_cameras: bool = False
+    # Object classes this app needs Tier-0 to TRACK on the cameras picked
+    # for it (COCO names: "backpack", "suitcase", …). Tier-0 tracks only
+    # the deployment's DETECT_LABELS by default (person, vehicles, pets),
+    # so an app riding it for anything else sees nothing on a stock
+    # install and no operator knows why. When the app is picked for a
+    # camera, the platform WIDENS Tier-0's per-camera label set with
+    # these — added on top of whatever the global set or an operator's
+    # narrowing names, never replacing either. Empty ⇒ the app is happy
+    # with the default set (or drives its own inference).
+    tier0_labels: list[str] = field(default_factory=list)
+    # Declarative operator actions (optional) — verbs the catalog can
+    # invoke on the app's contract surface via the server's JWT-only
+    # proxy. Empty ⇒ no Actions section renders.
+    actions: list[Action] = field(default_factory=list)
+    # Entities for Home Assistant (HA-114): values from /state, controls
+    # through the actions above. Empty ⇒ the app shows no entities.
+    entities: list[Entity] = field(default_factory=list)
+    # RFC-0002 Phase 4 app-surface convention: True ⇒ the app serves an
+    # HTML dashboard at GET /ui on its contract port, and core proxies
+    # it at /api/v1/apps/{id}/ui (the catalog renders it sandboxed).
+    has_ui: bool = False
+    # How the app's UI reaches the operator:
+    #   "internal" (default) — the sandboxed GET /ui dashboard above is
+    #       the whole surface, embedded in the catalog's app page.
+    #   "external" — the app is a full application with its own web UI
+    #       (multi-page, scripted, its own auth); the catalog renders an
+    #       "Open app" button instead of embedding. External UIs are NOT
+    #       proxied by core: the operator's browser talks to the app
+    #       directly, so ``ui_url`` must be reachable from the browser,
+    #       not just the compose network.
+    ui_mode: str = "internal"
+    # Where "Open app" points when ``ui_mode="external"``. Apps rarely
+    # know their deployment hostname at build time, so the literal
+    # placeholder ``{host}`` is replaced by the catalog with the hostname
+    # the operator is browsing from: ``"http://{host}:8090/"``.
+    ui_url: str = ""
+
+    # ── Store listing (the catalog's Details section) ───────────────
+    # The app's storefront: the catalog app page renders these so an
+    # operator can understand the app completely before enabling it.
+    # ``description`` is long-form text — blank-line-separated blocks
+    # render as paragraphs. ``use_cases`` is a short list of the
+    # concrete jobs the app solves ("Alarm on unregistered vehicles").
+    description: str = ""
+    author: str = ""
+    website: str = ""
+    license: str = ""
+    use_cases: list[str] = field(default_factory=list)
+    # Where a deployment can reach the developer for custom work —
+    # SMS/phone alert channels, site automation, bespoke features. A
+    # mailto: or https: URL; the catalog and vertical pages render it
+    # as a "contact" action. Empty = no contact surface shown.
+    contact: str = ""
+
+    # ── Commerce (the catalog's pricing badge and the licence gate) ─
+    # ``pricing``: "free" (default) | "paid" | "subscription" | "contact".
+    # ``price_note``: the human line under the badge — "$29 / camera /
+    # year", "free for 2 cameras". ``entitlement``: how the platform
+    # decides the app may be enabled — "none" (default: always) or
+    # "license_key": an administrator enters a key in the catalog, core
+    # asks the app to verify it (``ContractMixin.verify_license``) and
+    # refuses to enable the app until the app says the key is valid.
+    # The verdict is the app's — core stores the key (encrypted) and
+    # the verdict, and re-delivers both on the live config poll.
+    pricing: str = "free"
+    price_note: str = ""
+    entitlement: str = "none"
+
+    def __post_init__(self) -> None:
+        if self.pricing not in PRICING_MODELS:
+            raise ValueError(
+                f"pricing must be one of {sorted(PRICING_MODELS)}, got {self.pricing!r}")
+        if self.entitlement not in ENTITLEMENT_MODES:
+            raise ValueError(
+                f"entitlement must be one of {sorted(ENTITLEMENT_MODES)}, "
+                f"got {self.entitlement!r}")
+        if self.ui_mode not in ("internal", "external"):
+            raise ValueError(
+                f"ui_mode must be 'internal' or 'external', got {self.ui_mode!r}"
+            )
+        if self.ui_mode == "external" and not self.ui_url:
+            raise ValueError(
+                "ui_mode='external' requires ui_url (the browser-reachable "
+                "URL of the app's UI; '{host}' is substituted by the catalog)"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        """The ``GET /manifest`` payload (and the ``manifest_json``
+        snapshot the app registry stores)."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "version": self.version,
+            "category": self.category,
+            "summary": self.summary,
+            "requires_tasks": list(self.requires_tasks),
+            "enrich_tasks": list(self.enrich_tasks),
+            "requires_adapters": list(self.requires_adapters),
+            "requires_scopes": list(self.requires_scopes),
+            "provides": list(self.provides),
+            "subscribes": self.subscribes,
+            "params": [p.to_dict() for p in self.params],
+            "emits": [a.to_dict() for a in self.emits],
+            "state_schema": [v.to_dict() for v in self.state_schema],
+            "actions": [a.to_dict() for a in self.actions],
+            "entities": [e.to_dict() for e in self.entities],
+            "overlay": bool(self.overlay),
+            "camera_picker": bool(self.camera_picker),
+            "all_cameras": bool(self.all_cameras),
+            "tier0_labels": list(self.tier0_labels),
+            "has_ui": bool(self.has_ui),
+            "ui_mode": self.ui_mode,
+            "ui_url": self.ui_url,
+            "description": self.description,
+            "author": self.author,
+            "website": self.website,
+            "license": self.license,
+            "use_cases": list(self.use_cases),
+            "contact": self.contact,
+            "pricing": self.pricing,
+            "price_note": self.price_note,
+            "entitlement": self.entitlement,
+        }
