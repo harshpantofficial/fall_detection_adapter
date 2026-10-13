@@ -23,4 +23,3 @@ from opennvr_app_sdk.alerts import (  # noqa: F401
 
 # Identify this app process
 set_default_source(kind="app", name="fall-detection", version="1.0.0")
-

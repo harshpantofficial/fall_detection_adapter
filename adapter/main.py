@@ -18,11 +18,12 @@ from __future__ import annotations
 import os
 from urllib.parse import urlparse
 
-from adapters.fall_detection.service import (
+from .service import (
     MAX_IMAGE_BYTES,
     MODEL_URL_ENV,
     FallDetectionService,
 )
+
 from opennvr_adapter_sdk import (
     AdapterApp,
     BodyShape,
@@ -84,5 +85,4 @@ app = _adapter_app.fastapi_app
 def __getattr__(name: str):
     if name == "_service":
         return _adapter_app.service
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

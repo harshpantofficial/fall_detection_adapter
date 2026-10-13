@@ -22,12 +22,13 @@ import cv2
 import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 
-from adapters.fall_detection.coco_keypoints import COCO_KEYPOINTS, COCO_SKELETON
-from adapters.fall_detection.fall_transformer import (
+from .coco_keypoints import COCO_KEYPOINTS, COCO_SKELETON
+from .fall_transformer import (
     FALL_CONFIDENCE_THRESHOLD,
     INPUT_TIMESTEPS,
     FallTransformer,
 )
+
 from opennvr_adapter_sdk import AdapterService, BODY_BYTES_KEY, ServiceError
 from opennvr_adapter_sdk.contract import (
     ErrorCategory,

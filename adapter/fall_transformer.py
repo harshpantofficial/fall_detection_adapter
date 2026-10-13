@@ -334,4 +334,3 @@ class FallTransformer:
             "frame_count": state.frame_count,
             "warmup_done": warmup_done,
         }
-        return None

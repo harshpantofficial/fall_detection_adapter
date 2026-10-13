@@ -1,0 +1,117 @@
+# ==========================================
+# OpenNVR — Fall Detection Overlay
+# ==========================================
+# Run alongside OpenNVR on the Windows PC:
+#   docker compose -f docker-compose.yml -f docker-compose.fall.yml up -d
+
+services:
+  # ── 1. Fall Detection AI Adapter (GPU Accelerated) ─────────────
+  fall-detection-adapter:
+    image: opennvr/fall-detection-adapter:1.0.0
+    build:
+      context: ./adapter
+      dockerfile: Dockerfile
+    container_name: opennvr_fall_detection_adapter
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - OPENNVR_ADAPTER_TOKEN=${INTERNAL_API_KEY}
+      - YOLO_POSE_WEIGHTS_DIR=/weights
+    volumes:
+      - opennvr_yolo_pose_weights:/weights:ro
+    ports:
+      - "9010:9010"
+    networks:
+      - opennvr_internal
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx, sys; sys.exit(0 if httpx.get('http://127.0.0.1:9010/health', timeout=2).status_code == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+
+  # ── 2. Adapter Registration with KAI-C ─────────────────────────
+  fall-detection-register:
+    image: alpine:3.20
+    container_name: opennvr_fall_detection_register
+    restart: "no"
+    depends_on:
+      opennvr-core:
+        condition: service_healthy
+      fall-detection-adapter:
+        condition: service_healthy
+    networks:
+      - opennvr_internal
+    environment:
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        name="fall-detection"
+        url="http://fall-detection-adapter:9010"
+        echo "Registering '$$name' -> $$url with KAI-C..."
+        i=0
+        while [ $$i -lt 30 ]; do
+          if wget -q -O- \
+               --header="Content-Type: application/json" \
+               --header="X-Internal-Api-Key: $${INTERNAL_API_KEY}" \
+               --post-data="{\"name\":\"$$name\",\"url\":\"$$url\"}" \
+               http://opennvr-core:8100/api/v1/adapters/register >/dev/null 2>&1; then
+            echo "Registered '$$name'."
+            wget -q -O- \
+                 --header="X-Internal-Api-Key: $${INTERNAL_API_KEY}" \
+                 --post-data="" \
+                 "http://opennvr-core:8100/api/v1/adapters/$$name/permissions/approve-all" >/dev/null 2>&1 || true
+            exit 0
+          fi
+          i=$$((i+1))
+          echo "Retrying registration in 3s ($$i/30)..."
+          sleep 3
+        done
+        echo "WARN: Could not register '$$name' automatically." >&2
+        exit 0
+
+  # ── 3. Fall Detection Monitoring App ───────────────────────────
+  fall-detection-app:
+    image: opennvr/fall-detection-app:1.0.0
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: opennvr_fall_detection_app
+    restart: unless-stopped
+    depends_on:
+      nats:
+        condition: service_healthy
+      opennvr-core:
+        condition: service_healthy
+      fall-detection-adapter:
+        condition: service_healthy
+    environment:
+      - OPENNVR_INTERNAL_API_KEY=${INTERNAL_API_KEY}
+      - NATS_URL=nats://nats:4222
+      - OPENNVR_URL=http://opennvr-core:8000
+    volumes:
+      - ./app/config.docker.yml:/app/config.yml:ro
+    ports:
+      - "9210:9210"
+    networks:
+      - opennvr_apps
+      - opennvr_internal
+
+networks:
+  opennvr_internal:
+    external: true
+  opennvr_apps:
+    external: true
+
+volumes:
+  opennvr_yolo_pose_weights:
+    external: true
