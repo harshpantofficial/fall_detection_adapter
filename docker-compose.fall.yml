@@ -24,7 +24,7 @@ services:
       - OPENNVR_ADAPTER_TOKEN=${INTERNAL_API_KEY}
       - YOLO_POSE_WEIGHTS_DIR=/weights
     volumes:
-      - opennvr_yolo_pose_weights:/weights:ro
+      - ./fall_detection:/weights:ro
     ports:
       - "9010:9010"
     networks:
@@ -110,8 +110,4 @@ networks:
   opennvr_internal:
     external: true
   opennvr_apps:
-    external: true
-
-volumes:
-  opennvr_yolo_pose_weights:
     external: true

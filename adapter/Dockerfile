@@ -8,18 +8,18 @@
 #     -e OPENNVR_ADAPTER_TOKEN=<token> \
 #     -v C:/models:/weights:ro \
 #     opennvr/fall-detection-adapter:1.0.0
- 
+
 FROM python:3.11-slim AS runtime
- 
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libgomp1 \
         libgl1 \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
- 
+
 WORKDIR /app
- 
+
 # Pin core dependencies; PyTorch + Ultralytics + ai-edge-litert
 RUN pip install --no-cache-dir \
         fastapi==0.127.0 \
@@ -33,23 +33,24 @@ RUN pip install --no-cache-dir \
         torch==2.5.1 \
         ultralytics==8.3.82 \
         ai-edge-litert==1.2.0
- 
+
 # Install OpenNVR Adapter SDK
-COPY adapter/opennvr_adapter_sdk ./opennvr_adapter_sdk/
+COPY opennvr_adapter_sdk/ ./opennvr_adapter_sdk/
 RUN pip install --no-cache-dir ./opennvr_adapter_sdk
- 
-# Copy adapter source
-COPY adapter/fall_detection/ ./adapters/fall_detection/
- 
+
+# Copy adapter source into adapters.fall_detection package
+RUN mkdir -p ./adapters/fall_detection && touch ./adapters/__init__.py
+COPY coco_keypoints.py fall_transformer.py main.py service.py __init__.py ./adapters/fall_detection/
+
 ENV PYTHONPATH=/app \
     OPENNVR_ADAPTER_TOKEN="" \
     YOLO_POSE_WEIGHTS_DIR=/weights \
     YOLO_POSE_MODEL_URL="" \
     FALL_TRANSFORMER_TFLITE_PATH=/weights/fall_detection_transformer.tflite
- 
+
 EXPOSE 9010
- 
+
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
     CMD python -c "import httpx, sys; sys.exit(0 if httpx.get('http://127.0.0.1:9010/health', timeout=2).status_code == 200 else 1)"
- 
+
 CMD ["uvicorn", "adapters.fall_detection.main:app", "--host", "0.0.0.0", "--port", "9010"]
