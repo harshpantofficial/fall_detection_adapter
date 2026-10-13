@@ -1,7 +1,7 @@
 [project]
 name = "opennvr-adapter-fall-detection"
 version = "1.0.0"
-description = "OpenNVR Fall Detection AI Adapter (YOLO Pose + Fall Transformer)"
+description = "OpenNVR Fall Detection AI Adapter (YOLO26 Pose + TFLite Fall Transformer)"
 requires-python = ">=3.11"
 license = { text = "AGPL-3.0" }
 dependencies = [
@@ -11,13 +11,10 @@ dependencies = [
     "pydantic>=2.8.0",
     "numpy>=1.26.0",
     "opencv-python-headless>=4.10.0",
-    "onnxruntime-gpu>=1.20.0",
+    "ultralytics>=8.3.0",
+    "ai-edge-litert>=1.0.0",
+    "torch>=2.0.0",
     "websockets>=13.0",
-]
-
-[project.optional-dependencies]
-cpu = [
-    "onnxruntime>=1.20.0",
 ]
 
 [build-system]

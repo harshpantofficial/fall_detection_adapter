@@ -1,8 +1,8 @@
 """
 FallDetectionService — OpenNVR AI Adapter for pose estimation and fall detection.
 
-Combines YOLO pose estimation (ONNX Runtime, CUDA-accelerated) with the
-FallTransformer keypoint analysis engine. Implements the OpenNVR Adapter Contract v1
+Combines YOLO26 pose estimation (Ultralytics, CUDA/CPU) with the sequence-based
+FallTransformer TFLite engine. Implements the OpenNVR Adapter Contract v1
 with full HTTP (/infer) and WebSocket (/infer/stream) streaming capabilities.
 """
 from __future__ import annotations
@@ -18,10 +18,16 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import cv2
+import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 
-from adapters.fall_detection.coco_keypoints import COCO_KEYPOINTS, KEYPOINT_STRIDE
-from adapters.fall_detection.fall_transformer import FallTransformer
+from adapters.fall_detection.coco_keypoints import COCO_KEYPOINTS, COCO_SKELETON
+from adapters.fall_detection.fall_transformer import (
+    FALL_CONFIDENCE_THRESHOLD,
+    INPUT_TIMESTEPS,
+    FallTransformer,
+)
 from opennvr_adapter_sdk import AdapterService, BODY_BYTES_KEY, ServiceError
 from opennvr_adapter_sdk.contract import (
     ErrorCategory,
@@ -41,47 +47,61 @@ from opennvr_adapter_sdk.model_fetch import ensure_model_file
 
 logger = logging.getLogger(__name__)
 
-MODEL_FRAMEWORK: str = "onnxruntime"
-MODEL_NAME: str = "yolo11n-pose-fall"
+MODEL_FRAMEWORK: str = "ultralytics+tflite"
+MODEL_NAME: str = "yolo26n-pose-fall"
 MAX_IMAGE_BYTES: int = 8 * 1024 * 1024  # 8 MiB max request size
 
 DEFAULT_WEIGHTS_DIR: str = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "model_weights")
+    os.path.join(os.path.dirname(__file__), "..", "..", "fall_detection")
 )
-WEIGHTS_FILENAME: str = "yolo11n-pose.onnx"
+WEIGHTS_FILENAME: str = "yolo26n-pose.pt"
+TFLITE_FILENAME: str = "fall_detection_transformer.tflite"
 MODEL_URL_ENV: str = "YOLO_POSE_MODEL_URL"
 TFLITE_MODEL_ENV: str = "FALL_TRANSFORMER_TFLITE_PATH"
 
-DEFAULT_CONF: float = 0.4
+DEFAULT_CONF: float = 0.35
 DEFAULT_IOU: float = 0.45
-DEFAULT_IMGSZ: int = 448
+DEFAULT_IMGSZ: int = 640
 IMGSZ_STRIDE: int = 32
 MIN_IMGSZ: int = 160
 MAX_IMGSZ: int = 1280
 DEFAULT_MAX_PERSONS: int = 20
 ABSOLUTE_MAX_PERSONS: int = 100
-KEYPOINT_VISIBLE_CONF: float = 0.5
-EXPECTED_FEATURES: int = 5 + len(COCO_KEYPOINTS) * KEYPOINT_STRIDE
+KEYPOINT_VISIBLE_CONF: float = 0.4
 
 FALL_STATES = ("standing", "falling", "fallen", "unknown")
 
 
+def _find_weights_file(env_var: str, default_filename: str) -> str:
+    explicit = os.getenv(env_var)
+    if explicit and os.path.exists(explicit):
+        return explicit
+
+    candidates = [
+        explicit,
+        os.path.join(os.getenv("YOLO_POSE_WEIGHTS_DIR", DEFAULT_WEIGHTS_DIR), default_filename),
+        os.path.join(os.path.dirname(__file__), default_filename),
+        os.path.join(os.path.dirname(__file__), "..", "..", "fall_detection", default_filename),
+        os.path.join(os.path.dirname(__file__), "..", "fall_detection", default_filename),
+        os.path.join("/weights", default_filename),
+        os.path.join(os.getcwd(), default_filename),
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return os.path.abspath(c)
+    return explicit or os.path.join(DEFAULT_WEIGHTS_DIR, default_filename)
+
+
 class FallDetectionService(AdapterService):
-    """Façade around YOLO-pose ONNX and FallTransformer."""
+    """Façade around YOLO26-pose (Ultralytics) and FallTransformer (TFLite)."""
 
     def __init__(self, weights_path: str | None = None) -> None:
-        self._weights_path = weights_path or os.path.join(
-            os.getenv("YOLO_POSE_WEIGHTS_DIR", DEFAULT_WEIGHTS_DIR),
-            WEIGHTS_FILENAME,
-        )
+        self._weights_path = weights_path or _find_weights_file("YOLO_POSE_WEIGHTS_PATH", WEIGHTS_FILENAME)
         self._model_url: str = os.getenv(MODEL_URL_ENV, "")
-        self._tflite_path: str = os.getenv(
-            TFLITE_MODEL_ENV,
-            os.path.join(os.path.dirname(__file__), "fall_detection_transformer.tflite"),
-        )
-        self._session: Any | None = None
-        self._input_name: str = "images"
-        self._static_imgsz: int | None = None
+        self._tflite_path: str = _find_weights_file(TFLITE_MODEL_ENV, TFLITE_FILENAME)
+
+        self._yolo: Any | None = None
+        self._device: str = "cpu"
         self._load_state: HealthStatus = HealthStatus.LOADING
         self._load_error: str | None = None
         self._fingerprint_cache: str | None = None
@@ -89,7 +109,7 @@ class FallDetectionService(AdapterService):
         self._fall_transformer: FallTransformer | None = None
 
     def load(self) -> None:
-        """Eagerly load ONNX weights and initialize the fall transformer."""
+        """Eagerly load YOLO26 weights and initialize the FallTransformer."""
         if self._load_state == HealthStatus.OK:
             return
 
@@ -111,7 +131,8 @@ class FallDetectionService(AdapterService):
         )
 
         try:
-            import onnxruntime as ort
+            import torch
+            from ultralytics import YOLO
 
             ensure_model_file(
                 self._weights_path,
@@ -120,33 +141,34 @@ class FallDetectionService(AdapterService):
                 logger=logger,
             )
 
-            # Prioritize CUDAExecutionProvider on systems with NVIDIA GPUs
-            self._session = ort.InferenceSession(
-                self._weights_path,
-                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            self._device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._gpu_in_use = (self._device == "cuda")
+
+            logger.info("Loading YOLO26 pose model from %s on %s...", self._weights_path, self._device)
+            self._yolo = YOLO(self._weights_path)
+
+            logger.info("Loading FallTransformer from %s...", self._tflite_path)
+            self._fall_transformer = FallTransformer(
+                tflite_model_path=self._tflite_path,
+                timesteps=INPUT_TIMESTEPS,
+                threshold=FALL_CONFIDENCE_THRESHOLD,
             )
-            input_meta = self._session.get_inputs()[0]
-            self._input_name = input_meta.name
-            self._static_imgsz = _static_input_size(getattr(input_meta, "shape", None))
+
             self._fingerprint_cache = self._compute_fingerprint()
-            self._gpu_in_use = self._detect_gpu_in_use()
-
-            # Initialize FallTransformer
-            self._fall_transformer = FallTransformer(self._tflite_path)
-
             self._warm_up()
+
             self._load_state = HealthStatus.OK
             self._load_error = None
             logger.info(
-                "FallDetectionService ready: weights=%s gpu=%s imgsz=%s",
+                "FallDetectionService ready: weights=%s gpu=%s device=%s",
                 self._weights_path,
                 self._gpu_in_use,
-                self._static_imgsz or f"dynamic (default {DEFAULT_IMGSZ})",
+                self._device,
             )
         except Exception as exc:
             self._load_state = HealthStatus.ERROR
             self._load_error = str(exc)
-            logger.exception("FallDetectionService failed to load weights %s", self._weights_path)
+            logger.exception("FallDetectionService failed to load weights %s: %s", self._weights_path, exc)
 
     def is_ready(self) -> bool:
         return self._load_state == HealthStatus.OK
@@ -164,16 +186,24 @@ class FallDetectionService(AdapterService):
             framework=MODEL_FRAMEWORK,
             size_mb=self._weights_size_mb(),
             modalities_in=["image"],
-            modalities_out=["keypoints", "fall_state"],
+            modalities_out=["keypoints", "persons", "fall_state"],
             fingerprint=self.fingerprint(),
         )
 
     def hardware_evaluation(self) -> HardwareEvaluationResponse:
         cpu_count = os.cpu_count() or 0
+        device_name = "CPU"
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device_name = torch.cuda.get_device_name(0)
+        except Exception:
+            pass
+
         if self._load_state == HealthStatus.OK:
             if self._gpu_in_use:
                 verdict = HardwareVerdict.OK
-                reasoning = "NVIDIA CUDA GPU detected and active; ONNX weights loaded."
+                reasoning = f"NVIDIA CUDA GPU detected and active ({device_name}). YOLO26-pose and Transformer loaded."
             elif cpu_count >= 4:
                 verdict = HardwareVerdict.OK
                 reasoning = f"Running on CPU with {cpu_count} cores."
@@ -187,13 +217,6 @@ class FallDetectionService(AdapterService):
             verdict = HardwareVerdict.BLOCKED
             reasoning = f"Weights failed to load: {self._load_error}"
 
-        providers: list[str] = []
-        try:
-            import onnxruntime as ort
-            providers = list(ort.get_available_providers())
-        except Exception:
-            pass
-
         return HardwareEvaluationResponse(
             verdict=verdict,
             reasoning=reasoning,
@@ -201,12 +224,13 @@ class FallDetectionService(AdapterService):
             details={
                 "gpu_required": True,
                 "gpu_in_use": self._gpu_in_use,
-                "onnxruntime_providers": providers,
+                "device": self._device,
+                "device_name": device_name,
                 "cpu_count": cpu_count,
                 "platform": platform.platform(),
                 "python_version": platform.python_version(),
                 "weights_path": self._weights_path,
-                "default_imgsz": DEFAULT_IMGSZ,
+                "tflite_path": self._tflite_path,
             },
         )
 
@@ -256,7 +280,8 @@ class FallDetectionService(AdapterService):
             )
             return
 
-        logger.info("Stream session opened: session_id=%s client_id=%s", session_id, handshake.client_id)
+        stream_id = handshake.client_id or "default"
+        logger.info("Stream session opened: session_id=%s stream_id=%s", session_id, stream_id)
 
         paused = False
         frames_done = 0
@@ -335,6 +360,7 @@ class FallDetectionService(AdapterService):
                             bytes(frame_bytes),
                             seq=frame_meta.seq,
                             ts_ms=frame_meta.ts_ms,
+                            stream_id=stream_id,
                         )
                         await websocket.send_text(json.dumps(result_dict))
                         latency_seconds = result_dict.get("inference_ms", 0) / 1000.0
@@ -362,7 +388,7 @@ class FallDetectionService(AdapterService):
         image_bytes: bytes,
         params: dict[str, Any],
     ) -> InferResponse:
-        """Run pose estimation and fall classification."""
+        """Run YOLO26-pose estimation and FallTransformer classification."""
         if self._load_state != HealthStatus.OK:
             raise ServiceError(
                 ErrorCategory.MODEL_ERROR,
@@ -383,35 +409,46 @@ class FallDetectionService(AdapterService):
 
         conf = _float_param(params, "conf", DEFAULT_CONF, 0.0, 1.0, aliases=("confidence_threshold",))
         iou = _float_param(params, "iou", DEFAULT_IOU, 0.0, 1.0, aliases=("iou_threshold",))
-        imgsz = self._resolve_imgsz(params)
+        imgsz = _imgsz_param(params)
         max_persons = _int_param(params, "max_persons", DEFAULT_MAX_PERSONS, 1, ABSOLUTE_MAX_PERSONS)
+        stream_id = str(params.get("stream_id") or params.get("camera_id") or "default")
 
         start = time.monotonic()
         try:
             img, width, height = _decode_image(image_bytes)
-            raw, scale, pad_x, pad_y = self._run_inference(img, imgsz)
-            persons = self._shape_persons(
-                raw,
-                scale=scale,
-                pad_x=pad_x,
-                pad_y=pad_y,
-                width=width,
-                height=height,
+            results = self._yolo(
+                img,
+                verbose=False,
+                device=self._device,
                 conf=conf,
                 iou=iou,
-                max_persons=max_persons,
+                imgsz=imgsz,
             )
+            yolo_res = results[0]
 
-            # Classify fall state for every person
+            persons, best_kpts, _ = self._extract_persons(yolo_res, max_persons)
+
+            # Sequence fall transformer classification
+            fall_result = {"fall_detected": False, "fall_confidence": 0.0, "fall_state": "standing", "torso_angle_deg": 0.0}
             if self._fall_transformer:
-                for idx, person in enumerate(persons):
-                    fall_info = self._fall_transformer.analyze_person(
-                        person,
-                        frame_width=width,
-                        frame_height=height,
-                        track_id=str(idx),
-                    )
-                    person.update(fall_info)
+                fall_result = self._fall_transformer.analyze_frame(
+                    best_kpts,
+                    frame_width=width,
+                    frame_height=height,
+                    stream_id=stream_id,
+                )
+
+            fall_detected = bool(fall_result["fall_detected"])
+            fall_conf = float(fall_result["fall_confidence"])
+            fall_state = str(fall_result["fall_state"])
+            torso_angle = float(fall_result["torso_angle_deg"])
+
+            for p in persons:
+                p["fall_state"] = fall_state
+                p["fall_confidence"] = fall_conf
+                p["confidence"] = fall_conf if fall_detected else p["score"]
+                p["torso_angle_deg"] = torso_angle
+
         except DecodeError as exc:
             raise ServiceError(
                 ErrorCategory.TRANSPORT_ERROR,
@@ -442,7 +479,7 @@ class FallDetectionService(AdapterService):
                 if state in FALL_STATES:
                     self.metrics.inc_counter("adapter_fall_state_total", label_value=state)
                 for k_idx, kpt in enumerate(p.get("keypoints", [])):
-                    if kpt[2] >= KEYPOINT_VISIBLE_CONF:
+                    if k_idx < len(COCO_KEYPOINTS) and kpt[2] >= KEYPOINT_VISIBLE_CONF:
                         self.metrics.inc_counter(
                             "adapter_pose_keypoints_visible_total",
                             label_value=COCO_KEYPOINTS[k_idx],
@@ -456,19 +493,77 @@ class FallDetectionService(AdapterService):
             inference_ms=inference_ms,
             result={
                 "persons": persons,
+                "fall_detected": fall_detected,
+                "fall_confidence": fall_conf,
                 "keypoint_names": list(COCO_KEYPOINTS),
                 "frame_dimensions": {"w": width, "h": height},
             },
         )
+
+    def _extract_persons(
+        self,
+        yolo_result: Any,
+        max_persons: int,
+    ) -> tuple[list[dict[str, Any]], np.ndarray | None, np.ndarray | None]:
+        """Extract detected persons, finding the largest person for fall analysis."""
+        persons: list[dict[str, Any]] = []
+        best_kpts: np.ndarray | None = None
+        best_box: np.ndarray | None = None
+        max_area: float = -1.0
+
+        if yolo_result.boxes is None or len(yolo_result.boxes) == 0:
+            return persons, best_kpts, best_box
+
+        boxes_xyxy = yolo_result.boxes.xyxy.cpu().numpy()
+        scores = yolo_result.boxes.conf.cpu().numpy()
+        kpts_data = None
+        if yolo_result.keypoints is not None:
+            kpts_data = yolo_result.keypoints.data.cpu().numpy()
+
+        for idx in range(min(len(boxes_xyxy), max_persons)):
+            box = boxes_xyxy[idx]
+            area = float((box[2] - box[0]) * (box[3] - box[1]))
+
+            kpts_for_person = kpts_data[idx] if kpts_data is not None and idx < len(kpts_data) else None
+
+            if area > max_area and kpts_for_person is not None:
+                max_area = area
+                best_kpts = kpts_for_person
+                best_box = box
+
+            formatted_kpts: list[list[float]] = []
+            if kpts_for_person is not None:
+                for k in kpts_for_person:
+                    formatted_kpts.append([
+                        round(float(k[0]), 1),
+                        round(float(k[1]), 1),
+                        round(float(k[2]), 4),
+                    ])
+
+            persons.append({
+                "track_id": str(idx),
+                "bbox": [
+                    round(float(box[0]), 1),
+                    round(float(box[1]), 1),
+                    round(float(box[2]), 1),
+                    round(float(box[3]), 1),
+                ],
+                "score": round(float(scores[idx]), 4),
+                "keypoints": formatted_kpts,
+            })
+
+        return persons, best_kpts, best_box
 
     def _infer_frame_for_stream(
         self,
         image_bytes: bytes,
         seq: int,
         ts_ms: int,
+        stream_id: str = "default",
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         params = params or {}
+        params["stream_id"] = stream_id
         try:
             infer = self._infer_image_bytes(image_bytes, params)
             return ResultMessage(
@@ -500,112 +595,10 @@ class FallDetectionService(AdapterService):
                 result=envelope,
             ).model_dump(mode="json")
 
-    def _run_inference(self, img: Any, imgsz: int) -> tuple[Any, float, float, float]:
-        import numpy as np
-
-        blob, scale, pad_x, pad_y = _letterbox_blob(img, imgsz)
-        outputs = self._session.run(None, {self._input_name: blob})
-        raw = np.transpose(outputs[0], (0, 2, 1)).squeeze()
-        if raw.ndim == 1:
-            raw = np.expand_dims(raw, axis=0)
-
-        if raw.shape[-1] != EXPECTED_FEATURES:
-            raise ServiceError(
-                ErrorCategory.MODEL_ERROR,
-                code="yolo_pose.unexpected_model_output",
-                message=(
-                    f"Model emitted {raw.shape[-1]} features per prediction, "
-                    f"expected {EXPECTED_FEATURES}."
-                ),
-                transient=False,
-                http_status=500,
-            )
-        return raw, scale, pad_x, pad_y
-
-    def _shape_persons(
-        self,
-        raw: Any,
-        *,
-        scale: float,
-        pad_x: float,
-        pad_y: float,
-        width: int,
-        height: int,
-        conf: float,
-        iou: float,
-        max_persons: int,
-    ) -> list[dict[str, Any]]:
-        import numpy as np
-
-        scores = raw[:, 4].astype(float)
-        keep_mask = scores >= conf
-        if not bool(keep_mask.any()):
-            return []
-        rows = raw[keep_mask]
-        scores = scores[keep_mask]
-
-        cx, cy, bw, bh = rows[:, 0], rows[:, 1], rows[:, 2], rows[:, 3]
-        x1 = (cx - bw / 2.0 - pad_x) / scale
-        y1 = (cy - bh / 2.0 - pad_y) / scale
-        x2 = (cx + bw / 2.0 - pad_x) / scale
-        y2 = (cy + bh / 2.0 - pad_y) / scale
-        boxes = np.stack([x1, y1, x2, y2], axis=1).astype(float)
-        np.clip(boxes[:, 0::2], 0.0, float(width), out=boxes[:, 0::2])
-        np.clip(boxes[:, 1::2], 0.0, float(height), out=boxes[:, 1::2])
-
-        order = _nms(boxes, scores, iou)[:max_persons]
-
-        persons: list[dict[str, Any]] = []
-        for index in order:
-            row = rows[index]
-            keypoints: list[list[float]] = []
-            for slot in range(len(COCO_KEYPOINTS)):
-                base = 5 + slot * KEYPOINT_STRIDE
-                kx = (float(row[base]) - pad_x) / scale
-                ky = (float(row[base + 1]) - pad_y) / scale
-                kconf = float(row[base + 2])
-                kx = min(max(kx, 0.0), float(width))
-                ky = min(max(ky, 0.0), float(height))
-                keypoints.append([
-                    round(kx, 1),
-                    round(ky, 1),
-                    round(min(max(kconf, 0.0), 1.0), 4),
-                ])
-            box = boxes[index]
-            persons.append({
-                "bbox": [
-                    round(float(box[0]), 1),
-                    round(float(box[1]), 1),
-                    round(float(box[2]), 1),
-                    round(float(box[3]), 1),
-                ],
-                "score": round(float(scores[index]), 4),
-                "keypoints": keypoints,
-            })
-        return persons
-
-    def _resolve_imgsz(self, params: dict[str, Any]) -> int:
-        requested = _imgsz_param(params)
-        if self._static_imgsz is None:
-            return requested
-        if "imgsz" in params and requested != self._static_imgsz:
-            raise ServiceError(
-                ErrorCategory.TRANSPORT_ERROR,
-                code="malformed_input",
-                message=f"Model exported with fixed {self._static_imgsz}px input.",
-                transient=False,
-                http_status=400,
-            )
-        return self._static_imgsz
-
     def _warm_up(self) -> None:
         try:
-            import numpy as np
-
-            imgsz = self._static_imgsz or DEFAULT_IMGSZ
-            blank = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
-            blob, _, _, _ = _letterbox_blob(blank, imgsz)
-            self._session.run(None, {self._input_name: blob})
+            blank = np.zeros((DEFAULT_IMGSZ, DEFAULT_IMGSZ, 3), dtype=np.uint8)
+            self._yolo(blank, verbose=False, device=self._device, imgsz=DEFAULT_IMGSZ)
         except Exception:
             pass
 
@@ -614,7 +607,10 @@ class FallDetectionService(AdapterService):
 
     def _weights_size_mb(self) -> float | None:
         try:
-            return round(os.path.getsize(self._weights_path) / (1024 * 1024), 2)
+            total_size = os.path.getsize(self._weights_path)
+            if self._tflite_path and os.path.exists(self._tflite_path):
+                total_size += os.path.getsize(self._tflite_path)
+            return round(total_size / (1024 * 1024), 2)
         except OSError:
             return None
 
@@ -625,14 +621,11 @@ class FallDetectionService(AdapterService):
         with open(self._weights_path, "rb") as fh:
             for chunk in iter(lambda: fh.read(65536), b""):
                 digest.update(chunk)
+        if self._tflite_path and os.path.exists(self._tflite_path):
+            with open(self._tflite_path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    digest.update(chunk)
         return f"sha256:{digest.hexdigest()}"
-
-    def _detect_gpu_in_use(self) -> bool:
-        try:
-            providers = self._session.get_providers()
-            return "CUDAExecutionProvider" in providers
-        except Exception:
-            return False
 
 
 # ── Parameter parsing & preprocessing helpers ────────────────────────
@@ -727,68 +720,9 @@ class DecodeError(Exception):
 
 
 def _decode_image(image_bytes: bytes) -> tuple[Any, int, int]:
-    import cv2
-    import numpy as np
-
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         raise DecodeError("Could not decode frame as JPEG/PNG.")
     height, width = img.shape[:2]
     return img, width, height
-
-
-def _static_input_size(shape: Any) -> int | None:
-    if not isinstance(shape, (list, tuple)) or len(shape) < 2:
-        return None
-    height, width = shape[-2], shape[-1]
-    if isinstance(height, int) and isinstance(width, int) and height == width > 0:
-        return int(height)
-    return None
-
-
-def _letterbox_blob(img: Any, imgsz: int) -> tuple[Any, float, float, float]:
-    import cv2
-    import numpy as np
-
-    height, width = img.shape[:2]
-    scale = min(imgsz / float(width), imgsz / float(height))
-    new_w = max(1, int(round(width * scale)))
-    new_h = max(1, int(round(height * scale)))
-    left = int(round((imgsz - new_w) / 2.0))
-    top = int(round((imgsz - new_h) / 2.0))
-
-    interpolation = cv2.INTER_LINEAR if scale > 1 else cv2.INTER_AREA
-    resized = cv2.resize(img, (new_w, new_h), interpolation=interpolation)
-    canvas = np.full((imgsz, imgsz, 3), 114, dtype=np.uint8)
-    canvas[top:top + new_h, left:left + new_w] = resized
-
-    blob = canvas[:, :, ::-1].astype(np.float32) / 255.0
-    blob = np.ascontiguousarray(blob.transpose(2, 0, 1)[None, ...])
-    return blob, scale, float(left), float(top)
-
-
-def _nms(boxes: Any, scores: Any, iou_threshold: float) -> list[int]:
-    import numpy as np
-
-    areas = (boxes[:, 2] - boxes[:, 0]).clip(min=0) * (
-        boxes[:, 3] - boxes[:, 1]
-    ).clip(min=0)
-    order = scores.argsort()[::-1]
-    keep: list[int] = []
-    while order.size > 0:
-        current = int(order[0])
-        keep.append(current)
-        if order.size == 1:
-            break
-        rest = order[1:]
-        xx1 = np.maximum(boxes[current, 0], boxes[rest, 0])
-        yy1 = np.maximum(boxes[current, 1], boxes[rest, 1])
-        xx2 = np.minimum(boxes[current, 2], boxes[rest, 2])
-        yy2 = np.minimum(boxes[current, 3], boxes[rest, 3])
-        inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
-        union = areas[current] + areas[rest] - inter
-        iou = np.where(union > 0, inter / np.maximum(union, 1e-9), 1.0)
-        order = rest[iou <= iou_threshold]
-    return keep
-

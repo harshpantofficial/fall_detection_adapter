@@ -41,11 +41,11 @@ def _model_fetch_egress() -> list[str]:
     return [host] if host else []
 
 
-def _cuda_provider_available() -> bool:
+def _cuda_available() -> bool:
     try:
-        import onnxruntime as ort
+        import torch
 
-        return "CUDAExecutionProvider" in ort.get_available_providers()
+        return torch.cuda.is_available()
     except Exception:
         return False
 
@@ -61,7 +61,7 @@ _adapter_app = AdapterApp(
     body_shape=BodyShape.IMAGE,
     max_body_bytes=MAX_IMAGE_BYTES,
     permissions=Permissions(
-        gpu=_cuda_provider_available(),
+        gpu=_cuda_available(),
         network_egress=_model_fetch_egress(),
         host_filesystem=[],
         shared_memory_paths=[],
@@ -84,4 +84,5 @@ app = _adapter_app.fastapi_app
 def __getattr__(name: str):
     if name == "_service":
         return _adapter_app.service
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
