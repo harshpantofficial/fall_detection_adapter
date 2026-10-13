@@ -243,16 +243,7 @@ class FallTransformer:
             return
 
         try:
-            try:
-                from ai_edge_litert.interpreter import Interpreter
-            except ImportError:
-                try:
-                    import tflite_runtime.interpreter as tflite
-                    Interpreter = tflite.Interpreter
-                except ImportError:
-                    import tensorflow as tf
-                    Interpreter = tf.lite.Interpreter
-
+            from ai_edge_litert.interpreter import Interpreter
             self._interpreter = Interpreter(model_path=self._tflite_path)
             self._interpreter.allocate_tensors()
             self._input_details = self._interpreter.get_input_details()
@@ -261,6 +252,7 @@ class FallTransformer:
         except Exception as exc:
             logger.exception("FallTransformer: failed to initialize TFLite interpreter from %s: %s", self._tflite_path, exc)
             self._interpreter = None
+            raise RuntimeError(f"Failed to initialize TFLite model at {self._tflite_path}: {exc}") from exc
 
     def get_stream_state(self, stream_id: str) -> StreamState:
         if stream_id not in self._streams:
