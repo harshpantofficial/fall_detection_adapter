@@ -8,14 +8,15 @@ Supports:
 1. Pattern 2 (Continuous Streaming): Dedicated 24/7 frame loop at 5–15 FPS.
 2. Pattern 1 (Tier-0 Gated Streaming): Sleep/idle until Tier-0 detects a person,
    then stream frames down InferStream while the person is in view.
-3. Alerts: Evaluates fall persistence (fallen_seconds) and dispatches
+3. Hybrid connectivity: Works inside full OpenNVR stack (KAI-C + OpenNVR Core)
+   OR standalone direct mode (direct RTSP / video file + direct adapter WS).
+4. Alerts: Evaluates fall persistence (fallen_seconds) and dispatches
    'person-fallen' critical alerts to NATS and the OpenNVR UI.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import cv2
 import json
 import logging
@@ -24,7 +25,13 @@ import signal
 import sys
 import threading
 import time
-from typing import Any
+from pathlib import Path
+from typing import Any, Generator
+
+# Auto-detect local opennvr_app_sdk if present in same directory
+_LOCAL_SDK = Path(__file__).resolve().parent / "opennvr_app_sdk"
+if _LOCAL_SDK.exists() and str(_LOCAL_SDK) not in sys.path:
+    sys.path.insert(0, str(_LOCAL_SDK))
 
 from opennvr_app_sdk import Alert, AlertType, InferStream, KaiCError, OpenNVR
 from opennvr_app_sdk.alerts import build_dispatcher, set_default_source
@@ -39,8 +46,15 @@ logger = logging.getLogger("fall-stream-detector")
 # Identify app for alerts
 set_default_source(kind="app", name="fall-detection", version="1.0.0")
 
-# Configuration via environment variables or defaults
+# Configuration via environment variables with safe defaults
+OPENNVR_URL = os.getenv("OPENNVR_URL", "http://localhost:8000")
+KAIC_URL = os.getenv("KAIC_URL", os.getenv("OPENNVR_KAIC_URL", "http://localhost:8100"))
 ADAPTER_NAME = os.getenv("FALL_ADAPTER_NAME", "fall-detection")
+# Direct WS fallback (e.g. "ws://localhost:9000/infer/stream" for direct testing without KAI-C)
+ADAPTER_WS_URL = os.getenv("ADAPTER_WS_URL", "")
+# Direct RTSP / video file fallback (e.g. "rtsp://localhost:8554/cam1" or "fall_example_1.mp4")
+RTSP_URL = os.getenv("RTSP_URL", "")
+
 TARGET_FPS = float(os.getenv("STREAM_FPS", "10.0"))
 FRAME_WIDTH = int(os.getenv("STREAM_WIDTH", "640"))
 FALLEN_SECONDS = float(os.getenv("FALLEN_SECONDS", "3.0"))
@@ -51,12 +65,81 @@ NATS_URL = os.getenv("NATS_URL", "nats://nats:4222")
 INTERNAL_KEY = os.getenv("INTERNAL_API_KEY", os.getenv("OPENNVR_INTERNAL_API_KEY", ""))
 
 
+class DirectInferStream:
+    """Connects directly to an adapter's WS /infer/stream (bypassing KAI-C proxy)."""
+
+    def __init__(self, ws_url: str, camera_id: str = "cam1", timeout: float = 5.0) -> None:
+        self.ws_url = ws_url
+        self.camera_id = camera_id
+        self.timeout = timeout
+        self.conn: Any = None
+        self._seq = 0
+        self.correlation_id: str | None = None
+
+    def __enter__(self) -> "DirectInferStream":
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def open(self) -> "DirectInferStream":
+        from websockets.sync.client import connect
+
+        self.conn = connect(self.ws_url, open_timeout=self.timeout)
+        # §6.1 Handshake
+        self.conn.send(
+            json.dumps({
+                "type": "handshake",
+                "client_id": "fall-stream-worker",
+                "camera_id": self.camera_id,
+                "frame_transport": "websocket",
+            })
+        )
+        ack_raw = self.conn.recv(timeout=self.timeout)
+        ack = json.loads(ack_raw) if isinstance(ack_raw, str) else json.loads(ack_raw.decode())
+        self.correlation_id = ack.get("correlation_id", f"direct-{self.camera_id}")
+        self._seq = 0
+        return self
+
+    def infer(self, jpeg: bytes) -> dict[str, Any]:
+        if not self.conn:
+            self.open()
+        self._seq += 1
+        # 1. Metadata frame (JSON)
+        self.conn.send(
+            json.dumps({
+                "type": "frame",
+                "seq": self._seq,
+                "ts_ms": int(time.monotonic() * 1000),
+                "content_type": "image/jpeg",
+            })
+        )
+        # 2. Binary frame (JPEG bytes)
+        self.conn.send(jpeg)
+        res_raw = self.conn.recv(timeout=self.timeout)
+        payload = json.loads(res_raw) if isinstance(res_raw, str) else json.loads(res_raw.decode())
+        return {
+            "status": "ok",
+            "result": payload.get("result") or {},
+            "correlation_id": self.correlation_id,
+        }
+
+    def close(self) -> None:
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+
 class CameraStreamSession:
     """Manages continuous or Tier-0 gated streaming for a single camera."""
 
     def __init__(
         self,
-        nvr: OpenNVR,
+        nvr: OpenNVR | None,
         dispatcher: Any,
         camera_id: str,
         adapter_name: str = ADAPTER_NAME,
@@ -109,6 +192,92 @@ class CameraStreamSession:
         # Gated mode: active if a person was seen within PERSON_HOLD_TIME_S
         return (time.monotonic() - self._last_person_seen) <= PERSON_HOLD_TIME_S
 
+    def _get_infer_stream_context(self):
+        """Returns either a DirectInferStream or SDK InferStream context manager."""
+        if ADAPTER_WS_URL:
+            logger.info("[%s] Using direct WebSocket: %s", self.camera_id, ADAPTER_WS_URL)
+            return DirectInferStream(ADAPTER_WS_URL, camera_id=self.camera_id)
+        if self.nvr is not None:
+            return self.nvr.ai.stream(self.adapter_name, camera_id=self.camera_id)
+        # Fallback to direct adapter on port 9000
+        fallback_url = "ws://localhost:9000/infer/stream"
+        logger.info("[%s] Falling back to default direct adapter WS: %s", self.camera_id, fallback_url)
+        return DirectInferStream(fallback_url, camera_id=self.camera_id)
+
+    def _iter_frames(self) -> Generator[bytes, None, None]:
+        """Yields JPEG frame bytes from RTSP URL, OpenCV, or OpenNVR SDK."""
+        rtsp_source = RTSP_URL or os.getenv("CAMERA_RTSP_URL", "")
+
+        # If direct RTSP/video source is specified, use OpenCV VideoCapture
+        if rtsp_source:
+            source = rtsp_source.format(camera_id=self.camera_id) if "{camera_id}" in rtsp_source else rtsp_source
+            logger.info("[%s] Reading direct video source: %s", self.camera_id, source)
+            cap = cv2.VideoCapture(source)
+            if not cap.isOpened():
+                raise RuntimeError(f"Could not open video source: {source}")
+
+            delay = 1.0 / self.fps
+            try:
+                while not self._stop.is_set():
+                    t0 = time.monotonic()
+                    ret, bgr = cap.read()
+                    if not ret:
+                        # If video file ended, loop back for testing
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, bgr = cap.read()
+                        if not ret:
+                            time.sleep(1.0)
+                            continue
+
+                    if self.width and bgr.shape[1] != self.width:
+                        h = int(bgr.shape[0] * (self.width / bgr.shape[1]))
+                        bgr = cv2.resize(bgr, (self.width, h))
+
+                    success, jpeg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if success:
+                        yield jpeg.tobytes()
+
+                    elapsed = time.monotonic() - t0
+                    sleep_time = delay - elapsed
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+            finally:
+                cap.release()
+            return
+
+        # Otherwise use OpenNVR SDK frame stream (MediaMTX via OpenNVR Core)
+        if self.nvr is not None:
+            with self.nvr.stream(self.camera_id, width=self.width, fps=self.fps) as video:
+                for frame in video.frames(timeout=10.0):
+                    if self._stop.is_set():
+                        return
+                    bgr = frame.to_ndarray()
+                    success, jpeg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if success:
+                        yield jpeg.tobytes()
+            return
+
+        # Direct MediaMTX fallback if neither RTSP_URL nor Core is present
+        mediamtx_url = f"rtsp://localhost:8554/{self.camera_id}"
+        logger.info("[%s] Trying default MediaMTX RTSP: %s", self.camera_id, mediamtx_url)
+        cap = cv2.VideoCapture(mediamtx_url)
+        delay = 1.0 / self.fps
+        try:
+            while not self._stop.is_set():
+                t0 = time.monotonic()
+                ret, bgr = cap.read()
+                if not ret:
+                    time.sleep(1.0)
+                    continue
+                success, jpeg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if success:
+                    yield jpeg.tobytes()
+                elapsed = time.monotonic() - t0
+                if delay > elapsed:
+                    time.sleep(delay - elapsed)
+        finally:
+            cap.release()
+
     def _run_loop(self) -> None:
         logger.info(
             "Starting camera worker [%s] (fps=%.1f, gated=%s)",
@@ -117,45 +286,32 @@ class CameraStreamSession:
 
         while not self._stop.is_set():
             try:
-                # 1. Tap the RTSP stream from MediaMTX via OpenNVR SDK
-                with self.nvr.stream(self.camera_id, width=self.width, fps=self.fps) as video:
-                    # 2. Open warm WebSocket session to KAI-C / Adapter
-                    with self.nvr.ai.stream(self.adapter_name, camera_id=self.camera_id) as infer_stream:
-                        logger.info(
-                            "[%s] Connected to /infer/stream (session correlation_id=%s)",
-                            self.camera_id, infer_stream.correlation_id,
-                        )
+                with self._get_infer_stream_context() as infer_stream:
+                    logger.info(
+                        "[%s] Connected to /infer/stream (session correlation_id=%s)",
+                        self.camera_id, getattr(infer_stream, "correlation_id", "active"),
+                    )
 
-                        for frame in video.frames(timeout=10.0):
-                            if self._stop.is_set():
-                                return
+                    for raw_jpeg in self._iter_frames():
+                        if self._stop.is_set():
+                            return
 
-                            # In gated mode: skip inference if no person is around
-                            if not self._should_infer():
-                                self._reset_fall_tracking()
-                                time.sleep(0.1)
-                                continue
+                        # In gated mode: skip inference if no person is around
+                        if not self._should_infer():
+                            self._reset_fall_tracking()
+                            time.sleep(0.1)
+                            continue
 
-                            # Frame comes as BGR raw bytes; encode to JPEG for §6 wire protocol
-                            bgr = frame.to_ndarray()
-                            success, jpeg_bytes = cv2.imencode(
-                                ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 80]
+                        try:
+                            # Send JPEG down WebSocket & receive ResultMessage
+                            response = infer_stream.infer(raw_jpeg)
+                            self._evaluate_detections(response, raw_jpeg)
+                        except (KaiCError, Exception) as err:
+                            logger.warning(
+                                "[%s] InferStream error: %s (reconnecting)",
+                                self.camera_id, err,
                             )
-                            if not success:
-                                continue
-
-                            raw_jpeg = jpeg_bytes.tobytes()
-
-                            try:
-                                # 3. Send JPEG down WebSocket & receive ResultMessage
-                                response = infer_stream.infer(raw_jpeg)
-                                self._evaluate_detections(response, raw_jpeg)
-                            except KaiCError as err:
-                                logger.warning(
-                                    "[%s] InferStream error: %s (reconnecting)",
-                                    self.camera_id, err,
-                                )
-                                break  # Re-open stream
+                            break  # Re-open stream
 
             except Exception as exc:
                 logger.error(
@@ -167,7 +323,6 @@ class CameraStreamSession:
     def _reset_fall_tracking(self) -> None:
         if self._alert_fired:
             logger.info("[%s] Person stood up or left view. Fall state cleared.", self.camera_id)
-            # Emit resolution alert if desired
             self._dispatch_resolved_alert()
         self._first_fall_time = None
         self._alert_fired = False
@@ -198,9 +353,8 @@ class CameraStreamSession:
                     self._alert_fired = True
                     self._last_alert_time = now
         else:
-            # No fall in current frame
             if self._first_fall_time is not None:
-                # Require grace period before clearing to avoid jitter
+                # Require 1.5s grace period before clearing to avoid frame-drop jitter
                 if (now - self._first_fall_time) > 1.5:
                     self._reset_fall_tracking()
 
@@ -261,7 +415,18 @@ class StreamOrchestrator:
 
     def __init__(self, cameras: list[str]) -> None:
         self.camera_ids = cameras
-        self.nvr = OpenNVR()
+
+        # Initialize OpenNVR client with safe defaults (handles standalone vs integrated)
+        try:
+            self.nvr: OpenNVR | None = OpenNVR(
+                url=OPENNVR_URL,
+                kaic_url=KAIC_URL,
+                token=INTERNAL_KEY or None,
+            )
+        except Exception as exc:
+            logger.warning("OpenNVR platform init: %s (direct mode available)", exc)
+            self.nvr = None
+
         self.dispatcher = build_dispatcher(
             webhook_url=os.getenv("WEBHOOK_URL"),
             nats_url=NATS_URL,
@@ -336,7 +501,11 @@ class StreamOrchestrator:
         self._stop = True
         for session in self.sessions.values():
             session.stop()
-        self.nvr.close()
+        if self.nvr:
+            try:
+                self.nvr.close()
+            except Exception:
+                pass
 
 
 def main():
