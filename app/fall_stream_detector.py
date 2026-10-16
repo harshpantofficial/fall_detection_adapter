@@ -28,7 +28,7 @@ from typing import Any
 
 from opennvr_app_sdk import Alert, AlertType, InferStream, KaiCError, OpenNVR
 from opennvr_app_sdk.alerts import build_dispatcher, set_default_source
-from opennvr_app_sdk.nats_loop import connect_nats
+from opennvr_app_sdk.credentials import bus_connection
 
 logging.basicConfig(
     level=logging.INFO,
@@ -296,7 +296,17 @@ class StreamOrchestrator:
             NATS_URL,
         )
         try:
-            nc = await connect_nats(NATS_URL, INTERNAL_KEY or None)
+            import nats
+        except ImportError:
+            logger.error("The 'nats-py' package is not installed. Run 'pip install nats-py' to enable Tier-0 gating.")
+            return
+
+        try:
+            connect_kwargs = bus_connection(None, NATS_URL, INTERNAL_KEY or None)
+            connect_kwargs.setdefault("connect_timeout", 5.0)
+            connect_kwargs.setdefault("reconnect_time_wait", 1.0)
+            connect_kwargs.setdefault("max_reconnect_attempts", -1)
+            nc = await nats.connect(**connect_kwargs)
         except Exception as exc:
             logger.error("Could not connect to NATS for Tier-0 events: %s", exc)
             return
@@ -314,11 +324,13 @@ class StreamOrchestrator:
             except Exception as e:
                 logger.debug("Error parsing Tier-0 event: %s", e)
 
-        sub = await nc.subscribe("opennvr.inference.tier0.>", cb=on_tier0_msg)
-        while not self._stop:
-            await asyncio.sleep(1.0)
-        await sub.unsubscribe()
-        await nc.close()
+        try:
+            sub = await nc.subscribe("opennvr.inference.tier0.>", cb=on_tier0_msg)
+            while not self._stop:
+                await asyncio.sleep(1.0)
+            await sub.unsubscribe()
+        finally:
+            await nc.close()
 
     def stop(self) -> None:
         self._stop = True
