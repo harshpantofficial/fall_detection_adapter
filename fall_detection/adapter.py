@@ -233,21 +233,33 @@ async def stream_handler(websocket) -> None:
     paused:      bool = False
 
     # ── 1. Handshake ─────────────────────────────────────────────────────
-    raw = await websocket.receive()
-    handshake = HandshakeMessage.model_validate_json(raw)
+    msg = await websocket.receive()
+    raw = msg.get("text") if isinstance(msg, dict) else msg
+    if not raw:
+        print("[stream] Empty handshake message, closing")
+        return
 
-    session_id     = (
+    try:
+        handshake = HandshakeMessage.model_validate_json(raw)
+    except Exception as exc:
+        print(f"[stream] Handshake parse failed: {exc}")
+        return
+
+    session_id = (
         f"fall-{handshake.camera_id}-"
         f"{datetime.datetime.utcnow().strftime('%H%M%S%f')}"
     )
     correlation_id = session_id
 
-    await websocket.send(
-        HandshakeAckMessage(
-            session_id=session_id,
-            correlation_id=correlation_id,
-        ).model_dump_json()
-    )
+    ack_json = HandshakeAckMessage(
+        session_id=session_id,
+        correlation_id=correlation_id,
+    ).model_dump_json()
+
+    if hasattr(websocket, "send_text"):
+        await websocket.send_text(ack_json)
+    else:
+        await websocket.send(ack_json)
 
     stream_id = handshake.camera_id or "default"
     state     = _streams[stream_id]
@@ -257,46 +269,86 @@ async def stream_handler(websocket) -> None:
     # ── 2. Frame loop ─────────────────────────────────────────────────────
     try:
         while True:
-            raw = await websocket.receive()
+            msg = await websocket.receive()
+            if isinstance(msg, dict):
+                if msg.get("type") == "websocket.disconnect":
+                    break
+                raw = msg.get("text")
+            else:
+                raw = msg
+
+            if not raw:
+                continue
 
             # Detect close before full parse (avoid parse errors on close frames)
             try:
                 envelope = json.loads(raw)
             except (json.JSONDecodeError, TypeError):
                 break
-            if envelope.get("type") == StreamMessageType.CLOSE:
+
+            msg_type = envelope.get("type")
+            if msg_type in (StreamMessageType.CLOSE, "close"):
+                break
+            if msg_type in (StreamMessageType.PAUSE, "pause"):
+                paused = True
+                continue
+            if msg_type in (StreamMessageType.RESUME, "resume"):
+                paused = False
+                continue
+
+            try:
+                frame_msg = FrameMessage.model_validate(envelope)
+            except Exception as exc:
+                print(f"[stream] Bad frame metadata: {exc}")
                 break
 
-            frame_msg = FrameMessage.model_validate_json(raw)
             queue_depth += 1
+
+            # In §6 streaming protocol: binary frame payload follows metadata frame
+            bin_msg = await websocket.receive()
+            if isinstance(bin_msg, dict):
+                frame_data = bin_msg.get("bytes")
+            else:
+                frame_data = bin_msg
+
+            if not frame_data:
+                queue_depth -= 1
+                continue
 
             # ── Backpressure: pause if queue is full ──────────────────
             if queue_depth >= MAX_QUEUE and not paused:
-                await websocket.send(PauseMessage().model_dump_json())
+                pause_json = PauseMessage().model_dump_json()
+                if hasattr(websocket, "send_text"):
+                    await websocket.send_text(pause_json)
+                else:
+                    await websocket.send(pause_json)
                 paused = True
                 print(f"[stream] {session_id} → PauseMessage (queue={queue_depth})")
 
             # ── Run blocking inference in thread pool ─────────────────
             # YOLO and TFLite are synchronous; run_in_executor keeps the
             # async event loop free to process incoming messages concurrently.
-            frame_data = frame_msg.data  # capture before lambda closure
             fall_detected, confidence, yolo_result = await loop.run_in_executor(
                 None,
-                lambda: run_inference(
-                    _decode_frame(frame_data),
+                lambda fd=frame_data: run_inference(
+                    _decode_frame(fd),
                     state,
                     model["yolo_pose"],
                     model["interpreter"],
                     model["input_details"],
                     model["output_details"],
-                    device="cuda",
+                    device="cuda" if model.get("device") == "cuda" else "cpu",
                 ),
             )
             queue_depth -= 1
 
             # ── Resume when queue drains ──────────────────────────────
             if paused and queue_depth <= MAX_QUEUE // 2:
-                await websocket.send(ResumeMessage().model_dump_json())
+                resume_json = ResumeMessage().model_dump_json()
+                if hasattr(websocket, "send_text"):
+                    await websocket.send_text(resume_json)
+                else:
+                    await websocket.send(resume_json)
                 paused = False
                 print(f"[stream] {session_id} → ResumeMessage (queue={queue_depth})")
 
@@ -325,23 +377,27 @@ async def stream_handler(websocket) -> None:
                 )
 
             # ── Send ResultMessage (seq echo required by §6) ──────────
-            # ResultMessage.frame = PNG bytes on fall events, None otherwise.
-            # KAI-C stores the frame field as the VMS event snapshot image.
-            await websocket.send(
-                ResultMessage(
-                    seq=frame_msg.seq,
-                    result={
-                        "detections": [d.model_dump() for d in detections],
-                    },
-                    frame=png_bytes,  # None on normal frames; PNG on fall
-                ).model_dump_json()
-            )
+            result_json = ResultMessage(
+                seq=frame_msg.seq,
+                result={
+                    "detections": [d.model_dump() for d in detections],
+                },
+                frame=png_bytes,  # None on normal frames; PNG on fall
+            ).model_dump_json()
+
+            if hasattr(websocket, "send_text"):
+                await websocket.send_text(result_json)
+            else:
+                await websocket.send(result_json)
 
     except Exception as exc:
         print(f"[stream] {session_id} error: {exc}")
 
     finally:
-        await websocket.close(StreamCloseCode.NORMAL)
+        try:
+            await websocket.close(StreamCloseCode.NORMAL)
+        except Exception:
+            pass
         print(f"[stream] Session closed: {session_id}")
 
 

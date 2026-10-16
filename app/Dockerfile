@@ -23,10 +23,11 @@ COPY opennvr_app_sdk/ /opt/opennvr-app-sdk/
 RUN pip install --no-cache-dir hatchling && pip install --no-cache-dir /opt/opennvr-app-sdk
 
 # Copy app code
-COPY fall_detection.py  ./fall_detection.py
-COPY alerts.py          ./alerts.py
-COPY config.example.yml ./config.example.yml
-COPY config.docker.yml  ./config.yml
+COPY fall_detection.py        ./fall_detection.py
+COPY fall_stream_detector.py ./fall_stream_detector.py
+COPY alerts.py                ./alerts.py
+COPY config.example.yml       ./config.example.yml
+COPY config.docker.yml        ./config.yml
 
 ENV PYTHONUNBUFFERED=1
 
