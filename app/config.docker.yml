@@ -4,7 +4,7 @@ nats_url: "nats://nats:4222"
 nats_token: "${INTERNAL_API_KEY}"
 
 subject_pattern: "opennvr.inference.>"
-consume_tier0: false
+consume_tier0: true
 
 fallen_seconds: 3.0
 alert_cooldown_seconds: 30.0

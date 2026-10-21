@@ -147,6 +147,7 @@ services:
     networks:
       - opennvr_apps
       - opennvr_internal
+      - opennvr_default
 
 networks:
   opennvr_internal:
@@ -155,3 +156,6 @@ networks:
   opennvr_apps:
     external: true
     name: open-nvr_opennvr_apps
+  opennvr_default:
+    external: true
+    name: open-nvr_default
