@@ -20,5 +20,5 @@ nats_alerts_url: "nats://nats:4222"
 # Contract server (:9210) & auto-registration with OpenNVR Core
 contract_port: 9210
 contract_bind_host: "0.0.0.0"
-contract_host: "fall-detection"
+contract_host: "fall-detection-app"
 opennvr_url: "http://opennvr-core:8000"
