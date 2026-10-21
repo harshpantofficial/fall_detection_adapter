@@ -47,7 +47,7 @@ RUN pip install --no-cache-dir ./opennvr_adapter_sdk
 
 # Copy adapter source into adapters.fall_detection package
 RUN mkdir -p ./adapters/fall_detection && touch ./adapters/__init__.py
-COPY coco_keypoints.py fall_transformer.py fall_detection_core.py main.py service.py __init__.py ./adapters/fall_detection/
+COPY coco_keypoints.py fall_transformer.py main.py service.py __init__.py ./adapters/fall_detection/
 
 ENV PYTHONPATH=/app \
     OPENNVR_ADAPTER_TOKEN="" \
