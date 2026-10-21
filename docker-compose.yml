@@ -138,9 +138,8 @@ services:
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
       - NATS_URL=nats://nats:4222
       - OPENNVR_URL=http://opennvr-core:8000
-      # MediaMTX HLS base URL — used by the app UI to construct stream URLs.
-      # Set this to the address your browser can reach MediaMTX on.
-      - MEDIAMTX_URL=${MEDIAMTX_URL:-http://localhost:8888}
+      # Internal MediaMTX address reachable from inside Docker (for HLS proxy).
+      - MEDIAMTX_INTERNAL_URL=${MEDIAMTX_INTERNAL_URL:-http://mediamtx:8189}
     volumes:
       - ./app/config.docker.yml:/app/config.yml:ro
     ports:

@@ -287,6 +287,8 @@ class FallDetectionDetector(Detector):
         self._started_at = time.time()
         self._nvr = None
         self._nvr_tried = False
+        self._stream_path_cache: dict[str, str | None] = {}
+        self._stream_path_last_fetch: dict[str, float] = {}
 
     def handle_event(self, event: Any) -> list[Alert]:
         """Support both 'persons' (from pose adapter) and 'detections' (from generic pipeline)."""
@@ -651,18 +653,18 @@ class FallDetectionDetector(Detector):
             r for r in self._recent if r.get("level") in ("high", "critical")
         ][-10:]
 
-        # Provide HLS stream URLs for all known cameras so the UI can attach video
+        # Provide proxied HLS URLs for all known cameras so the UI can attach video.
+        # We proxy via /proxy/hls/{cam_id}/... on our own contract server so the
+        # browser never needs to authenticate against MediaMTX directly.
         stream_urls: dict[str, str | None] = {}
-        if not hasattr(self, "_stream_url_cache"):
-            self._stream_url_cache: dict[str, str | None] = {}
-            self._stream_url_last_fetch: dict[str, float] = {}
         for cam_id in set(list(self.cfg.cameras.keys()) + [p["camera"] for p in persons_list]):
-            last = self._stream_url_last_fetch.get(cam_id, 0.0)
+            last = self._stream_path_last_fetch.get(cam_id, 0.0)
             if now - last > 300:  # re-fetch every 5 min
-                url = self._fetch_stream_url(cam_id)
-                self._stream_url_cache[cam_id] = url
-                self._stream_url_last_fetch[cam_id] = now
-            stream_urls[cam_id] = self._stream_url_cache.get(cam_id)
+                path = self._fetch_stream_path(cam_id)
+                self._stream_path_cache[cam_id] = path
+                self._stream_path_last_fetch[cam_id] = now
+            path = self._stream_path_cache.get(cam_id)
+            stream_urls[cam_id] = f"/proxy/hls/{cam_id}/index.m3u8" if path else None
 
         return {
             "fallen_now": fallen_count,
@@ -682,10 +684,82 @@ class FallDetectionDetector(Detector):
         if contract is not None:
             # /api/state — JSON state snapshot for the UI to poll (includes stream_urls)
             contract._routes["/api/state"] = self.state_snapshot  # type: ignore[attr-defined]
+            # Patch the request handler to serve /proxy/hls/* as raw bytes
+            self._patch_hls_proxy(contract)
         return contract
 
-    def _fetch_stream_url(self, camera_id: str) -> str | None:
-        """Return an HLS URL for this camera by proxying OpenNVR core's stream token endpoint."""
+    def _patch_hls_proxy(self, contract: Any) -> None:
+        """Monkey-patch the ContractServer's HTTP handler to serve HLS proxy routes.
+
+        The ContractServer only supports JSON routes. We wrap do_GET to intercept
+        /proxy/hls/{camera_id}/{tail...} and proxy the bytes from internal MediaMTX.
+        """
+        detector_ref = self
+        http_server = getattr(contract, "_server", None) or getattr(contract, "_httpd", None)
+        if http_server is None:
+            # Find the underlying HTTPServer object on the contract
+            for attr in vars(contract):
+                obj = getattr(contract, attr, None)
+                if hasattr(obj, "RequestHandlerClass"):
+                    http_server = obj
+                    break
+        if http_server is None:
+            logger.warning("HLS proxy: could not locate HTTPServer on ContractServer")
+            return
+
+        OriginalHandler = http_server.RequestHandlerClass
+
+        class PatchedHandler(OriginalHandler):  # type: ignore[valid-type]
+            def do_GET(self) -> None:  # noqa: N802
+                path = self.path.split("?", 1)[0]
+                if path.startswith("/proxy/hls/"):
+                    # /proxy/hls/{camera_id}/{tail}
+                    rest = path[len("/proxy/hls/"):]
+                    parts = rest.split("/", 1)
+                    camera_id = parts[0]
+                    tail = parts[1] if len(parts) > 1 else "index.m3u8"
+                    stream_path = detector_ref._stream_path_cache.get(camera_id)
+                    if not stream_path:
+                        stream_path = detector_ref._fetch_stream_path(camera_id)
+                        if stream_path:
+                            detector_ref._stream_path_cache[camera_id] = stream_path
+                    if not stream_path:
+                        self.send_response(503)
+                        self.end_headers()
+                        return
+                    result = detector_ref._proxy_hls(stream_path, tail)
+                    if result is None:
+                        self.send_response(502)
+                        self.end_headers()
+                        return
+                    body, ct = result
+                    # Rewrite absolute segment URLs in playlists to go via our proxy
+                    if "mpegurl" in ct.lower() or tail.endswith(".m3u8"):
+                        import re as _re
+                        text = body.decode("utf-8", errors="replace")
+                        mediamtx_base = os.getenv("MEDIAMTX_INTERNAL_URL", "http://mediamtx:8888")
+                        prefix = f"{mediamtx_base.rstrip('/')}/{stream_path}/"
+                        text = text.replace(prefix, f"/proxy/hls/{camera_id}/")
+                        body = text.encode("utf-8")
+                        ct = "application/vnd.apple.mpegurl"
+                    self.send_response(200)
+                    self.send_header("Content-Type", ct)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                super().do_GET()
+
+        http_server.RequestHandlerClass = PatchedHandler
+        logger.info("HLS proxy patched into contract server")
+
+    def _fetch_stream_path(self, camera_id: str) -> str | None:
+        """Return the MediaMTX stream path for this camera via the app platform endpoint.
+
+        Uses GET /api/v1/internal/app/cameras/{id}/stream with X-Internal-Api-Key.
+        Returns the 'path' field (e.g. 'cam-1') which we use to build a proxy URL.
+        """
         opennvr_url = getattr(self.cfg, "opennvr_url", None)
         if not opennvr_url:
             return None
@@ -695,21 +769,36 @@ class FallDetectionDetector(Detector):
             or os.getenv("INTERNAL_API_KEY")
         )
         try:
+            cam_int = int(camera_id)
+        except (ValueError, TypeError):
+            logger.debug("stream-path: camera_id %r is not an integer, skipping", camera_id)
+            return None
+        try:
+            import json as _json
             import urllib.request
             req = urllib.request.Request(
-                f"{opennvr_url.rstrip('/')}/streams/token/{camera_id}",
-                headers={"Authorization": f"Bearer {token}"} if token else {},
+                f"{opennvr_url.rstrip('/')}/api/v1/internal/app/cameras/{cam_int}/stream",
+                headers={"X-Internal-Api-Key": token} if token else {},
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
-                import json as _json
                 data = _json.loads(resp.read().decode("utf-8"))
-            hls_url = data.get("hls_url") or data.get("url") or data.get("stream_url") or ""
-            if not hls_url and data.get("token"):
-                mediamtx_url = os.getenv("MEDIAMTX_URL", "http://mediamtx:8888")
-                hls_url = f"{mediamtx_url}/{camera_id}/index.m3u8?token={data['token']}"
-            return hls_url or None
+            return data.get("path") or None
         except Exception as exc:
-            logger.debug("stream-url fetch failed for %s: %s", camera_id, exc)
+            logger.debug("stream-path fetch failed for camera %s: %s", camera_id, exc)
+            return None
+
+    def _proxy_hls(self, stream_path: str, tail: str) -> tuple[bytes, str] | None:
+        """Fetch an HLS playlist or segment from internal MediaMTX and return (body, content_type)."""
+        mediamtx_url = os.getenv("MEDIAMTX_INTERNAL_URL", "http://mediamtx:8189")
+        url = f"{mediamtx_url.rstrip('/')}/{stream_path}/{tail.lstrip('/')}"
+        try:
+            import urllib.request
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                body = resp.read()
+                ct = resp.headers.get("Content-Type", "application/octet-stream")
+            return body, ct
+        except Exception as exc:
+            logger.debug("HLS proxy fetch failed %s: %s", url, exc)
             return None
 
     def ui_html(self) -> str:
