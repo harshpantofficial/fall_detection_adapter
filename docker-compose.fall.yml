@@ -119,6 +119,17 @@ services:
       - opennvr_internal
       - opennvr_default
 
+  # ── 4. Patch detect-pipeline to route persons → fall-detection ────
+  # Overrides DEFAULT_ROUTES and ADAPTER_TASKS, sets gate to enforce,
+  # and points DETECT_DISPATCH_KAIC_URL at the correct internal address.
+  detect-pipeline:
+    environment:
+      - DETECT_GATE_MODE=enforce
+      - DETECT_DISPATCH_KAIC_URL=http://opennvr-core:8100
+      - DETECT_DISPATCH_TASK=pose_estimation
+    volumes:
+      - ./dispatch_patch.py:/app/detect_pipeline/dispatch.py:ro
+
 networks:
   opennvr_internal:
     external: true
