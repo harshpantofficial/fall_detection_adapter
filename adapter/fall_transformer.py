@@ -18,28 +18,21 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Keypoint definitions matching fall_detection_core.py
-YOLO_KEYPOINT_NAMES = [
+# COCO-17 keypoint names (YOLO26-pose output order = training order)
+COCO_KEYPOINT_NAMES = [
     "Nose", "Left Eye", "Right Eye", "Left Ear", "Right Ear",
     "Left Shoulder", "Right Shoulder", "Left Elbow", "Right Elbow",
     "Left Wrist", "Right Wrist", "Left Hip", "Right Hip",
     "Left Knee", "Right Knee", "Left Ankle", "Right Ankle",
 ]
 
-YOUR_KEYPOINT_NAMES_TRAINING = [
-    "Nose", "Left Eye", "Right Eye", "Left Ear", "Right Ear",
-    "Left Shoulder", "Right Shoulder", "Left Elbow", "Right Elbow",
-    "Left Wrist", "Right Wrist", "Left Hip", "Right Hip",
-    "Left Knee", "Right Knee", "Left Ankle", "Right Ankle",
-]
-
-SORTED_YOUR_KEYPOINT_NAMES = sorted(YOUR_KEYPOINT_NAMES_TRAINING)
-KEYPOINT_DICT_TRAINING = {name: i for i, name in enumerate(SORTED_YOUR_KEYPOINT_NAMES)}
+SORTED_COCO_KEYPOINT_NAMES = sorted(COCO_KEYPOINT_NAMES)
+KEYPOINT_DICT_TRAINING = {name: i for i, name in enumerate(SORTED_COCO_KEYPOINT_NAMES)}
 NUM_KEYPOINTS_TRAINING = len(KEYPOINT_DICT_TRAINING)
 NUM_FEATURES = NUM_KEYPOINTS_TRAINING * 3  # 51 features
 
 YOLO_IDX_TO_NAME = {
-    i: name for i, name in enumerate(YOLO_KEYPOINT_NAMES)
+    i: name for i, name in enumerate(COCO_KEYPOINT_NAMES)
     if name in KEYPOINT_DICT_TRAINING
 }
 

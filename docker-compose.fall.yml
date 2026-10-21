@@ -1,8 +1,19 @@
 # ==========================================
-# OpenNVR — Fall Detection Overlay
+# OpenNVR — Fall Detection Overlay Compose
 # ==========================================
-# Run alongside OpenNVR on the Windows PC:
-#   docker compose -f docker-compose.yml -f docker-compose.fall.yml up -d
+# OVERLAY mode: extends the main OpenNVR core stack.
+# 'nats' and 'opennvr-core' must come from the base compose file.
+#
+# Usage:
+#   docker compose \
+#     -f /path/to/opennvr/docker-compose.yml \
+#     -f docker-compose.fall.yml \
+#     up -d --build
+#
+# The services here reference 'nats' and 'opennvr-core' from the base file
+# as healthcheck dependencies — Docker Compose resolves cross-file depends_on
+# when files are merged with -f.
+# ==========================================
 
 services:
   # ── 1. Fall Detection AI Adapter (GPU Accelerated) ─────────────
@@ -42,8 +53,7 @@ services:
     container_name: opennvr_fall_detection_register
     restart: "no"
     depends_on:
-      opennvr-core:
-        condition: service_healthy
+      # opennvr-core comes from the base compose file (merged via -f)
       fall-detection-adapter:
         condition: service_healthy
     networks:
@@ -96,8 +106,10 @@ services:
         condition: service_healthy
     environment:
       - OPENNVR_INTERNAL_API_KEY=${INTERNAL_API_KEY}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
       - NATS_URL=nats://nats:4222
       - OPENNVR_URL=http://opennvr-core:8000
+      - MEDIAMTX_URL=${MEDIAMTX_URL:-http://localhost:8888}
     volumes:
       - ./app/config.docker.yml:/app/config.yml:ro
     ports:

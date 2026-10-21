@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime as _dt
 import html as _html
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -235,19 +236,32 @@ def load_config(path: str) -> AppConfig:
         cameras[cid] = CameraWatch(camera_id=cid, frame_width=w, frame_height=h)
 
     active_hours = ActiveHours.parse(raw.get("active_hours"))
+    def _token(key: str) -> str | None:
+        val = str(raw.get(key) or "").strip()
+        if not val:
+            return None
+        if val.startswith("${"):
+            # Docker Compose expands ${VAR} before writing env vars but the YAML
+            # file is read verbatim at runtime — fall back to env vars.
+            return (
+                os.getenv("OPENNVR_INTERNAL_API_KEY")
+                or os.getenv("INTERNAL_API_KEY")
+            ) or None
+        return val
+
     return AppConfig(
         nats_url=nats_url,
-        nats_token=str(raw["nats_token"]) if raw.get("nats_token") else None,
+        nats_token=_token("nats_token"),
         subject_pattern=subject,
         cameras=cameras,
         webhook_url=str(raw["webhook_url"]) if raw.get("webhook_url") else None,
         nats_alerts_url=str(raw["nats_alerts_url"]) if raw.get("nats_alerts_url") else None,
-        nats_alerts_token=str(raw["nats_alerts_token"]) if raw.get("nats_alerts_token") else None,
+        nats_alerts_token=_token("nats_alerts_token"),
         contract_port=int(raw["contract_port"]) if raw.get("contract_port") is not None else None,
         contract_bind_host=str(raw.get("contract_bind_host")) if raw.get("contract_bind_host") else None,
         contract_host=str(raw.get("contract_host")) if raw.get("contract_host") else None,
         opennvr_url=str(raw["opennvr_url"]) if raw.get("opennvr_url") else None,
-        opennvr_token=str(raw["opennvr_token"]) if raw.get("opennvr_token") else None,
+        opennvr_token=_token("opennvr_token"),
         fallen_seconds=float(raw.get("fallen_seconds", 3.0)),
         alert_severity=str(raw.get("alert_severity", "critical")).lower(),
         alert_cooldown_seconds=float(raw.get("alert_cooldown_seconds", 30.0)),
@@ -377,6 +391,24 @@ class FallDetectionDetector(Detector):
             torso_angle = float(item.get("torso_angle_deg", 0.0))
             fall_conf = float(item.get("fall_confidence", item.get("confidence", 0.0)))
 
+            # Normalised bbox dict for the UI overlay
+            if isinstance(bbox, dict):
+                norm_bbox = {
+                    "x": float(bbox.get("x", 0.0)),
+                    "y": float(bbox.get("y", 0.0)),
+                    "w": float(bbox.get("w", 0.0)),
+                    "h": float(bbox.get("h", 0.0)),
+                }
+            elif isinstance(bbox, list) and len(bbox) >= 4:
+                norm_bbox = {
+                    "x": float(bbox[0]),
+                    "y": float(bbox[1]),
+                    "w": float(bbox[2]) - float(bbox[0]),
+                    "h": float(bbox[3]) - float(bbox[1]),
+                }
+            else:
+                norm_bbox = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+
             rec = self._persons.touch(key, at=event_ts)
             d = rec.data
             if not d:
@@ -388,11 +420,13 @@ class FallDetectionDetector(Detector):
                     "alerted": False,
                     "wall_offset": now - event_ts,
                     "anchor": (centre_x, centre_y),
+                    "bbox": norm_bbox,
                 })
             else:
                 d["last_angle"] = torso_angle
                 d["last_conf"] = fall_conf
                 d["anchor"] = (centre_x, centre_y)
+                d["bbox"] = norm_bbox
 
                 # State transitions
                 if fall_state == FALLEN:
@@ -597,6 +631,8 @@ class FallDetectionDetector(Detector):
                 "fallen_s": round(elapsed, 1) if st == FALLEN else 0,
                 "angle_deg": d.get("last_angle", 0.0),
                 "alerted": d.get("alerted", False),
+                "confidence": d.get("last_conf", 0.0),
+                "bbox": d.get("bbox", {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}),
             })
 
         per_camera = []
@@ -611,6 +647,23 @@ class FallDetectionDetector(Detector):
                 "last": self._last_seen.get(cam_id),
             })
 
+        recent_alerts = [
+            r for r in self._recent if r.get("level") in ("high", "critical")
+        ][-10:]
+
+        # Provide HLS stream URLs for all known cameras so the UI can attach video
+        stream_urls: dict[str, str | None] = {}
+        if not hasattr(self, "_stream_url_cache"):
+            self._stream_url_cache: dict[str, str | None] = {}
+            self._stream_url_last_fetch: dict[str, float] = {}
+        for cam_id in set(list(self.cfg.cameras.keys()) + [p["camera"] for p in persons_list]):
+            last = self._stream_url_last_fetch.get(cam_id, 0.0)
+            if now - last > 300:  # re-fetch every 5 min
+                url = self._fetch_stream_url(cam_id)
+                self._stream_url_cache[cam_id] = url
+                self._stream_url_last_fetch[cam_id] = now
+            stream_urls[cam_id] = self._stream_url_cache.get(cam_id)
+
         return {
             "fallen_now": fallen_count,
             "standing_now": standing_count,
@@ -618,61 +671,289 @@ class FallDetectionDetector(Detector):
             "persons": persons_list,
             "per_camera": per_camera,
             "recent": list(self._recent),
+            "recent_alerts": recent_alerts,
+            "stream_urls": stream_urls,
             "since": self._started_at,
         }
 
+    def start_contract_server(self):
+        # super() sets self._contract_server and returns it
+        contract = super().start_contract_server()
+        if contract is not None:
+            # /api/state — JSON state snapshot for the UI to poll (includes stream_urls)
+            contract._routes["/api/state"] = self.state_snapshot  # type: ignore[attr-defined]
+        return contract
+
+    def _fetch_stream_url(self, camera_id: str) -> str | None:
+        """Return an HLS URL for this camera by proxying OpenNVR core's stream token endpoint."""
+        opennvr_url = getattr(self.cfg, "opennvr_url", None)
+        if not opennvr_url:
+            return None
+        token = (
+            getattr(self.cfg, "opennvr_token", None)
+            or os.getenv("OPENNVR_INTERNAL_API_KEY")
+            or os.getenv("INTERNAL_API_KEY")
+        )
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                f"{opennvr_url.rstrip('/')}/streams/token/{camera_id}",
+                headers={"Authorization": f"Bearer {token}"} if token else {},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                import json as _json
+                data = _json.loads(resp.read().decode("utf-8"))
+            hls_url = data.get("hls_url") or data.get("url") or data.get("stream_url") or ""
+            if not hls_url and data.get("token"):
+                mediamtx_url = os.getenv("MEDIAMTX_URL", "http://mediamtx:8888")
+                hls_url = f"{mediamtx_url}/{camera_id}/index.m3u8?token={data['token']}"
+            return hls_url or None
+        except Exception as exc:
+            logger.debug("stream-url fetch failed for %s: %s", camera_id, exc)
+            return None
+
     def ui_html(self) -> str:
-        snap = self.state_snapshot()
-        esc = _html.escape
-        now = time.time()
-
-        def format_time(ts):
-            if not ts:
-                return "—"
-            delta = int(now - ts)
-            return f"{delta}s ago" if delta < 60 else f"{delta // 60}m ago"
-
-        rows = "".join(
-            f"<tr><td>{esc(p['camera'])}</td><td>{esc(p['track'])}</td>"
-            f"<td><span class='pill' style='background:{'#c62a2f' if p['state'] == FALLEN else '#46a758'}'>"
-            f"{esc(p['state'])}</span></td><td>{p['fallen_s']}s</td><td>{p['angle_deg']}°</td>"
-            f"<td>{'YES' if p['alerted'] else 'NO'}</td></tr>"
-            for p in snap["persons"]
-        )
-
-        table = ("<table><tr><th>Camera</th><th>Track</th><th>State</th><th>Down</th><th>Angle</th><th>Alerted</th></tr>"
-                 + rows + "</table>") if rows else "<p class='dim'>No active persons tracked.</p>"
-
-        cards = "".join(
-            f"<section class='card'><h2>{esc(r['camera'])}</h2>"
-            f"<div class='stats'><div><b>{r['fallen']}</b><span class='dim'>fallen</span></div>"
-            f"<div><b>{r['standing']}</b><span class='dim'>standing</span></div>"
-            f"<div><b>{r['alerts_today']}</b><span class='dim'>alerts</span></div></div>"
-            f"<div class='dim small'>last seen {format_time(r['last'])}</div></section>"
-            for r in snap["per_camera"]
-        )
-
-        return f"""<!doctype html>
-<title>Fall Detection</title>
+        return """<!doctype html>
+<title>Fall Detection Monitor</title>
 <style>
- body {{ font: 14px system-ui, sans-serif; margin: 1.2rem; color: #1a1a1a; background: #fafafa; }}
- h1 {{ font-size: 1.2rem; margin: 0 0 .2rem }} h2 {{ font-size: .95rem; margin: .8rem 0 .4rem }}
- .dim {{ color: #6b6f76; font-weight: 400 }} .small {{ font-size: .8rem }}
- .pill {{ color: #fff; border-radius: 10px; padding: 2px 8px; font-size: .75rem; font-weight: 600; }}
- .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: .8rem; margin: .8rem 0 }}
- .card {{ background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; padding: .7rem .9rem }}
- .stats {{ display: flex; gap: 1rem; margin: .4rem 0; }}
- .stats b {{ font-size: 1.2rem; display: block }}
- table {{ border-collapse: collapse; width: 100%; margin-top: .4rem; background: #fff; }}
- th, td {{ text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #e0e0e0; }}
- th {{ color: #6b6f76; font-weight: 500 }}
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: #f5f5f5; color: #1a1a1a; }
+@media (prefers-color-scheme: dark) {
+  body { background: #111; color: #e8e8e8; }
+  .card { background: #1e1e1e; border-color: #333; }
+  th { color: #aaa; }
+  td { border-color: #333; }
+  .badge { border-color: #444; }
+}
+header { background: #111; color: #fff; padding: .6rem 1rem; display: flex; align-items: center; gap: 1rem; }
+header h1 { font-size: 1rem; margin: 0; font-weight: 600; }
+#metrics { display: flex; gap: 1.5rem; font-size: .85rem; }
+#metrics span { opacity: .7; }
+#metrics b { font-size: 1.3rem; display: block; }
+main { padding: 1rem; }
+.section-title { font-size: .8rem; font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
+  opacity: .5; margin: 1.2rem 0 .5rem; }
+.camera-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 1rem; }
+.camera-tile { background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden; }
+@media (prefers-color-scheme: dark) { .camera-tile { background: #1e1e1e; border-color: #333; } }
+.tile-header { padding: .4rem .7rem; font-size: .8rem; font-weight: 600;
+  background: #222; color: #fff; display: flex; justify-content: space-between; align-items: center; }
+.tile-body { position: relative; background: #000; aspect-ratio: 16/9; }
+.tile-body video { width: 100%; height: 100%; object-fit: contain; display: block; }
+.tile-body canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+.tile-footer { padding: .3rem .7rem; font-size: .75rem; opacity: .6; }
+.badge { display: inline-block; border-radius: 10px; padding: 1px 8px; font-size: .72rem;
+  font-weight: 600; border: 1px solid transparent; }
+.badge-fallen { background: #c62a2f; color: #fff; }
+.badge-standing { background: #46a758; color: #fff; }
+.badge-loading { background: #888; color: #fff; }
+table { border-collapse: collapse; width: 100%; font-size: .82rem; }
+th { text-align: left; padding: .35rem .5rem; color: #6b6f76; font-weight: 500; border-bottom: 2px solid #e0e0e0; }
+td { padding: .35rem .5rem; border-bottom: 1px solid #eee; }
+#alerts-list { list-style: none; margin: 0; padding: 0; }
+#alerts-list li { padding: .3rem 0; font-size: .82rem; border-bottom: 1px solid #eee; }
+#alerts-list li:last-child { border-bottom: none; }
+.no-data { opacity: .4; font-size: .85rem; padding: .5rem 0; }
 </style>
-<h1>Fall Detection Monitor</h1>
-<div class="dim">Currently <b>{snap['fallen_now']}</b> fallen · <b>{snap['standing_now']}</b> standing · <b>{snap['today']['alerts']}</b> alerts today</div>
-<h2>Active Persons</h2>
-{table}
-<div class="grid">{cards or "<p class='dim'>No cameras configured.</p>"}</div>
-"""
+<header>
+  <h1>🛡 Fall Detection Monitor</h1>
+  <div id="metrics">
+    <div><b id="m-fallen">—</b><span>fallen now</span></div>
+    <div><b id="m-standing">—</b><span>standing</span></div>
+    <div><b id="m-alerts">—</b><span>alerts today</span></div>
+  </div>
+</header>
+<main>
+  <div class="section-title">Camera Streams</div>
+  <div id="camera-grid" class="camera-grid"><p class="no-data">Waiting for detections…</p></div>
+  <div class="section-title">Active Persons</div>
+  <table id="persons-table">
+    <thead><tr><th>Camera</th><th>Track</th><th>State</th><th>Down</th><th>Angle</th><th>Alerted</th></tr></thead>
+    <tbody id="persons-body"><tr><td colspan="6" class="no-data">No active persons.</td></tr></tbody>
+  </table>
+  <div class="section-title">Recent Alerts</div>
+  <ul id="alerts-list"><li class="no-data">No recent alerts.</li></ul>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.15/dist/hls.min.js"></script>
+<script>
+const hlsInstances = {};
+
+async function fetchState() {
+  try {
+    const r = await fetch('/api/state');
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+function ensureCameraTile(cameraId) {
+  const gridId = 'tile-' + CSS.escape(cameraId);
+  if (document.getElementById(gridId)) return;
+
+  const grid = document.getElementById('camera-grid');
+  // Clear placeholder text
+  const placeholder = grid.querySelector('.no-data');
+  if (placeholder) placeholder.remove();
+
+  const tile = document.createElement('div');
+  tile.id = gridId;
+  tile.className = 'camera-tile';
+  tile.innerHTML = `
+    <div class="tile-header">
+      <span>${cameraId}</span>
+      <span id="badge-${CSS.escape(cameraId)}" class="badge badge-loading">loading</span>
+    </div>
+    <div class="tile-body">
+      <video id="video-${CSS.escape(cameraId)}" autoplay muted playsinline></video>
+      <canvas id="canvas-${CSS.escape(cameraId)}"></canvas>
+    </div>
+    <div id="footer-${CSS.escape(cameraId)}" class="tile-footer">Initialising stream…</div>
+  `;
+  grid.appendChild(tile);
+
+  // HLS URL arrives via /api/state stream_urls — attached by attachStream()
+}
+
+function attachStream(cameraId, hlsUrl) {
+  if (hlsInstances[cameraId]) return;
+  const video = document.getElementById('video-' + CSS.escape(cameraId));
+  const footer = document.getElementById('footer-' + CSS.escape(cameraId));
+  if (!video) return;
+  if (Hls.isSupported()) {
+    const hls = new Hls({ lowLatencyMode: true });
+    hls.loadSource(hlsUrl);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.ERROR, (_, d) => {
+      if (d.fatal && footer) footer.textContent = 'Stream error: ' + d.type;
+    });
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      if (footer) footer.textContent = 'Live';
+    });
+    hlsInstances[cameraId] = hls;
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = hlsUrl;
+    hlsInstances[cameraId] = true;
+    if (footer) footer.textContent = 'Live (native HLS)';
+  } else {
+    if (footer) footer.textContent = 'HLS not supported in this browser.';
+  }
+}
+
+function drawOverlay(cameraId, persons) {
+  const canvas = document.getElementById('canvas-' + CSS.escape(cameraId));
+  const video = document.getElementById('video-' + CSS.escape(cameraId));
+  if (!canvas || !video) return;
+
+  const W = video.videoWidth || video.offsetWidth || 640;
+  const H = video.videoHeight || video.offsetHeight || 360;
+  canvas.width = W;
+  canvas.height = H;
+
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+
+  for (const p of persons) {
+    const bbox = p.bbox || {};
+    const x = (bbox.x || 0) * W;
+    const y = (bbox.y || 0) * H;
+    const w = (bbox.w || 0) * W;
+    const h = (bbox.h || 0) * H;
+    if (w < 2 || h < 2) continue;  // skip zero-area boxes
+
+    const fallen = p.state === 'fallen';
+    ctx.strokeStyle = fallen ? '#ff3333' : '#33ff66';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x, y, w, h);
+
+    const label = fallen
+      ? `FALLEN ${(p.confidence * 100).toFixed(0)}%`
+      : `person ${(p.confidence * 100).toFixed(0)}%`;
+    ctx.font = 'bold 12px system-ui';
+    ctx.fillStyle = fallen ? '#ff3333' : '#33ff66';
+    ctx.fillText(label, x + 2, y > 14 ? y - 3 : y + 13);
+  }
+}
+
+function timeSince(ts) {
+  if (!ts) return '—';
+  const s = Math.floor(Date.now() / 1000 - ts);
+  return s < 60 ? s + 's ago' : Math.floor(s / 60) + 'm ago';
+}
+
+async function refresh() {
+  const state = await fetchState();
+  if (!state) return;
+
+  document.getElementById('m-fallen').textContent = state.fallen_now ?? 0;
+  document.getElementById('m-standing').textContent = state.standing_now ?? 0;
+  document.getElementById('m-alerts').textContent = (state.today || {}).alerts ?? 0;
+
+  // Group persons by camera
+  const byCamera = {};
+  for (const p of (state.persons || [])) {
+    if (!byCamera[p.camera]) byCamera[p.camera] = [];
+    byCamera[p.camera].push(p);
+  }
+
+  // Ensure a tile exists for every camera with detections; attach stream + draw overlays
+  const streamUrls = state.stream_urls || {};
+  for (const [camId, persons] of Object.entries(byCamera)) {
+    ensureCameraTile(camId);
+    if (streamUrls[camId] && !hlsInstances[camId]) {
+      attachStream(camId, streamUrls[camId]);
+    }
+    drawOverlay(camId, persons);
+
+    // Update badge
+    const badge = document.getElementById('badge-' + CSS.escape(camId));
+    if (badge) {
+      const nFallen = persons.filter(p => p.state === 'fallen').length;
+      if (nFallen > 0) {
+        badge.className = 'badge badge-fallen';
+        badge.textContent = nFallen + ' fallen';
+      } else {
+        badge.className = 'badge badge-standing';
+        badge.textContent = persons.length + ' standing';
+      }
+    }
+  }
+
+  // Persons table
+  const tbody = document.getElementById('persons-body');
+  if (tbody) {
+    if (!state.persons || state.persons.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="no-data">No active persons.</td></tr>';
+    } else {
+      tbody.innerHTML = state.persons.map(p => {
+        const color = p.state === 'fallen' ? '#c62a2f' : '#46a758';
+        return `<tr>
+          <td>${p.camera}</td><td>${p.track}</td>
+          <td><span class="badge" style="background:${color};color:#fff">${p.state}</span></td>
+          <td>${p.fallen_s}s</td><td>${p.angle_deg.toFixed(1)}°</td>
+          <td>${p.alerted ? '⚠️ YES' : 'no'}</td>
+        </tr>`;
+      }).join('');
+    }
+  }
+
+  // Recent alerts
+  const alertsList = document.getElementById('alerts-list');
+  if (alertsList) {
+    const alerts = state.recent_alerts || [];
+    if (alerts.length === 0) {
+      alertsList.innerHTML = '<li class="no-data">No recent alerts.</li>';
+    } else {
+      alertsList.innerHTML = alerts.slice().reverse().map(a =>
+        `<li><b>${a.camera}</b> — ${a.message} <span style="opacity:.5">${timeSince(a.time)}</span></li>`
+      ).join('');
+    }
+  }
+}
+
+setInterval(refresh, 1000);
+refresh();
+</script>"""
 
 
 def main(argv: list[str] | None = None) -> int:

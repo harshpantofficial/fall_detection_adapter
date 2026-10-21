@@ -4,8 +4,6 @@ Matches OpenNVR example app architecture.
 """
 from __future__ import annotations
 
-import httpx  # noqa: F401
-
 from opennvr_app_sdk.alerts import (  # noqa: F401
     DEFAULT_ALERT_SUBJECT_PREFIX,
     Alert,

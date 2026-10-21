@@ -50,7 +50,9 @@ set_default_source(kind="app", name="fall-detection", version="1.0.0")
 OPENNVR_URL = os.getenv("OPENNVR_URL", "http://localhost:8000")
 KAIC_URL = os.getenv("KAIC_URL", os.getenv("OPENNVR_KAIC_URL", "http://localhost:8100"))
 ADAPTER_NAME = os.getenv("FALL_ADAPTER_NAME", "fall-detection")
-# Direct WS fallback (e.g. "ws://localhost:9000/infer/stream" for direct testing without KAI-C)
+# Direct WS fallback (e.g. "ws://localhost:9010/infer/stream" for direct testing without KAI-C)
+# This module is the direct-streaming path (no KAI-C proxy).
+# fall_detection.py is the NATS-subscriber path (with KAI-C). Both are valid alternatives.
 ADAPTER_WS_URL = os.getenv("ADAPTER_WS_URL", "")
 # Direct RTSP / video file fallback (e.g. "rtsp://localhost:8554/cam1" or "fall_example_1.mp4")
 RTSP_URL = os.getenv("RTSP_URL", "")
@@ -199,8 +201,8 @@ class CameraStreamSession:
             return DirectInferStream(ADAPTER_WS_URL, camera_id=self.camera_id)
         if self.nvr is not None:
             return self.nvr.ai.stream(self.adapter_name, camera_id=self.camera_id)
-        # Fallback to direct adapter on port 9000
-        fallback_url = "ws://localhost:9000/infer/stream"
+        # Fallback to direct adapter on port 9010
+        fallback_url = "ws://localhost:9010/infer/stream"
         logger.info("[%s] Falling back to default direct adapter WS: %s", self.camera_id, fallback_url)
         return DirectInferStream(fallback_url, camera_id=self.camera_id)
 
