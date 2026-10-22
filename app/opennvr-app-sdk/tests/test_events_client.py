@@ -1,0 +1,119 @@
+# Copyright (c) 2026 OpenNVR
+# SPDX-License-Identifier: Apache-2.0
+"""EventsClient — the SDK's read primitive for the platform's memory."""
+
+import asyncio
+import json
+
+from opennvr_app_sdk import EventsClient
+
+
+def _client(responses):
+    calls = []
+
+    async def http_get(url, headers):
+        calls.append((url, headers))
+        return responses.pop(0)
+
+    c = EventsClient("http://core:8000", "sekret", http_get=http_get)
+    return c, calls
+
+
+def test_search_builds_url_and_parses():
+    body = json.dumps({"events": [
+        {"id": 42, "camera_id": 3, "label": "person", "score": 0.91,
+         "started_at": "2026-08-12T15:12:04+00:00",
+         "ended_at": "2026-08-12T15:14:11+00:00",
+         "stationary": False, "plate_text": None, "has_evidence": True},
+        {"junk": "row is skipped, not fatal"},
+    ]}).encode()
+    c, calls = _client([(200, body)])
+    rows = asyncio.run(c.search(label="person", start="2026-08-12T15:00",
+                                end="2026-08-12T16:00"))
+    url, headers = calls[0]
+    assert "/api/v1/internal/camera-agent/events?" in url
+    assert "label=person" in url and "from=2026-08-12T15%3A00" in url
+    assert headers == {"X-Internal-Api-Key": "sekret"}
+    assert len(rows) == 1 and rows[0].id == 42 and rows[0].has_evidence
+
+
+def test_search_returns_none_on_failure_not_empty():
+    # None = "couldn't check"; [] = "nothing came". Different answers.
+    async def boom(url, headers):
+        raise OSError("core down")
+    c = EventsClient("http://core:8000", None, http_get=boom)
+    assert asyncio.run(c.search(label="car")) is None
+    c2, _calls = _client([(422, b"bad range")])
+    assert asyncio.run(c2.search(label="car")) is None
+    c3, _calls = _client([(200, b'{"events": []}')])
+    assert asyncio.run(c3.search(label="car")) == []
+
+
+def test_evidence_roundtrip_and_miss():
+    c, _ = _client([(200, b"\xff\xd8jpg"), (404, b"")])
+    assert asyncio.run(c.evidence(42)) == b"\xff\xd8jpg"
+    assert asyncio.run(c.evidence(43)) is None
+
+
+# ── attrs: what a skill SAID, not what the detector classified ───────
+
+
+def test_attrs_are_sent_as_repeated_parameters():
+    """The endpoint takes `attr` repeated. A list urlencoded WITHOUT
+    doseq becomes one parameter whose value is the string "['blue']",
+    which FastAPI rejects with a 422 that `search` turns into None —
+    indistinguishable from the store being unreachable."""
+    body = json.dumps({"events": []}).encode()
+    c, calls = _client([(200, body)])
+
+    asyncio.run(c.search(label="car", attrs=["blue", "van"]))
+
+    url, _ = calls[0]
+    assert "attr=blue" in url and "attr=van" in url
+    assert "%5B" not in url, "a list leaked through as a Python repr"
+
+
+def test_no_attrs_sends_no_attr_parameter():
+    """An empty filter must not become `attr=` — a blank value the
+    server would have to decide the meaning of."""
+    body = json.dumps({"events": []}).encode()
+    c, calls = _client([(200, body)])
+
+    asyncio.run(c.search(label="car"))
+
+    assert "attr" not in calls[0][0]
+
+
+def test_blank_attrs_are_dropped_rather_than_sent():
+    body = json.dumps({"events": []}).encode()
+    c, calls = _client([(200, body)])
+
+    asyncio.run(c.search(label="car", attrs=["  ", "", "blue"]))
+
+    url, _ = calls[0]
+    assert url.count("attr=") == 1 and "attr=blue" in url
+
+
+def test_search_keeps_cores_pending_block_beside_the_rows():
+    """core's `pending` says what it is describing NOW because this query
+    asked for a claim the visits did not have. Kept on the client, not in
+    the return type, so the list-of-events contract stands."""
+    body = json.dumps({"events": [], "pending": {"missing": 3, "requested": 3,
+                                                 "already_queued": 0, "eta_s": 45.0}}).encode()
+    c, _ = _client([(200, body)])
+    assert c.last_pending is None
+    rows = asyncio.run(c.search(label="car", attrs=["blue"]))
+    assert rows == [] and isinstance(rows, list)
+    assert rows.pending["missing"] == 3, "it rides on the rows — a list, still"
+    assert c.last_pending["missing"] == 3 and c.last_pending["eta_s"] == 45.0
+    # ...and a later answer without one clears it
+    c2, _ = _client([(200, json.dumps({"events": []}).encode())])
+    rows2 = asyncio.run(c2.search(label="car"))
+    assert c2.last_pending is None and rows2.pending is None
+    # ...and a failed search never leaves a previous question's block behind
+    c.last_pending = {"missing": 99}
+
+    async def boom(url, headers):
+        raise OSError("down")
+    c._get = boom
+    assert asyncio.run(c.search(label="car")) is None and c.last_pending is None

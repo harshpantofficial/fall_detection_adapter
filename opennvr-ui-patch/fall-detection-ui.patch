@@ -1,0 +1,619 @@
+diff --git a/app/src/components/VideoPlayer/DetectionOverlay.tsx b/app/src/components/VideoPlayer/DetectionOverlay.tsx
+index 16a5b0df..cd74da49 100644
+--- a/app/src/components/VideoPlayer/DetectionOverlay.tsx
++++ b/app/src/components/VideoPlayer/DetectionOverlay.tsx
+@@ -114,6 +114,40 @@ export function DetectionOverlay({ cameraId, staleMs = 2000 }: DetectionOverlayP
+   )
+ }
+ 
++// COCO-17 bones, by keypoint index — the same list the pose adapter ships
++// as COCO_SKELETON. A joint below the floor is not drawn: a pose model
++// still returns occluded joints, at low confidence and in a guessed place.
++const SKELETON: [number, number][] = [
++  [15, 13], [13, 11], [16, 14], [14, 12], [11, 12], [5, 11], [6, 12],
++  [5, 6], [5, 7], [6, 8], [7, 9], [8, 10], [1, 2], [0, 1], [0, 2],
++  [1, 3], [2, 4], [3, 5], [4, 6],
++]
++const KEYPOINT_FLOOR = 0.3
++
++function drawSkeleton(
++  ctx: CanvasRenderingContext2D, kps: [number, number, number][],
++  W: number, H: number, lw: number, hue: number, alpha: number,
++) {
++  const seen = (i: number) => i < kps.length && kps[i][2] > KEYPOINT_FLOOR
++  ctx.lineWidth = Math.max(1, lw * 0.75)
++  ctx.strokeStyle = `hsla(${hue}, 85%, 65%, ${0.9 * alpha})`
++  ctx.beginPath()
++  for (const [a, b] of SKELETON) {
++    if (!seen(a) || !seen(b)) continue
++    ctx.moveTo(kps[a][0] * W, kps[a][1] * H)
++    ctx.lineTo(kps[b][0] * W, kps[b][1] * H)
++  }
++  ctx.stroke()
++  ctx.fillStyle = `rgba(255,255,255,${alpha})`
++  const r = Math.max(1.5, lw)
++  for (let i = 0; i < kps.length; i++) {
++    if (!seen(i)) continue
++    ctx.beginPath()
++    ctx.arc(kps[i][0] * W, kps[i][1] * H, r, 0, Math.PI * 2)
++    ctx.fill()
++  }
++}
++
+ function drawTrack(
+   ctx: CanvasRenderingContext2D, t: OverlayTrack,
+   W: number, H: number, lw: number, fontPx: number, calibrating: boolean,
+@@ -134,6 +168,8 @@ function drawTrack(
+   ctx.strokeStyle = `hsla(${hue}, 85%, 60%, ${alpha})`
+   ctx.strokeRect(x, y, w, h)
+ 
++  if (t.keypoints) drawSkeleton(ctx, t.keypoints, W, H, lw, hue, alpha)
++
+   // Label chip: "person 91%" (+ id when the tracker has one). Sits above
+   // the box, or inside its top edge when the box touches the frame top.
+   //
+diff --git a/app/src/hooks/usePermissions.tsx b/app/src/hooks/usePermissions.tsx
+index 26e43e90..efad4879 100644
+--- a/app/src/hooks/usePermissions.tsx
++++ b/app/src/hooks/usePermissions.tsx
+@@ -129,6 +129,9 @@ export const NAV_PERMISSIONS = {
+   // behind the same permission as the alert inbox — and the API is
+   // gated on the same name, so the two cannot drift apart.
+   '/guard-compliance': 'alerts.view',
++  // Fall alarms carry a photograph of the person on the floor — the
++  // alerts tier, like the other incident pages.
++  '/falls': 'alerts.view',
+   // The face directory holds photographs of named people, so it sits
+   // with the alert inbox, like screening records do.
+   '/people': 'alerts.view',
+diff --git a/app/src/lib/appVerticals.ts b/app/src/lib/appVerticals.ts
+index f94351da..295e4ffb 100644
+--- a/app/src/lib/appVerticals.ts
++++ b/app/src/lib/appVerticals.ts
+@@ -150,6 +150,14 @@ export const APP_VERTICALS: AppVertical[] = [
+     // page is about whether people are being screened properly.
+     legacy: (m) => (m.requires_tasks ?? []).includes('pose_estimation'),
+   },
++  {
++    capability: 'falls',
++    to: '/falls',
++    // Named for what happened, not the model: the page is the falls,
++    // live and past, not a pose dashboard.
++    label: 'Falls',
++    legacy: (m) => (m.requires_tasks ?? []).includes('fall_detection'),
++  },
+ ]
+ 
+ /** Does this manifest provide `vertical`? Capability first, legacy
+diff --git a/app/src/lib/detectionFeed.ts b/app/src/lib/detectionFeed.ts
+index e1a662d0..ec814c3e 100644
+--- a/app/src/lib/detectionFeed.ts
++++ b/app/src/lib/detectionFeed.ts
+@@ -33,6 +33,9 @@ export interface OverlayTrack {
+   /** Normalized [x, y, w, h] in 0..1 of the frame. */
+   box: [number, number, number, number]
+   stationary?: boolean
++  /** A pose app's skeleton: COCO-17 [x, y, conf] in 0..1, slot order
++   *  kept (index 9 is the left wrist). Absent for plain boxes. */
++  keypoints?: [number, number, number][]
+ }
+ 
+ export interface OverlayFrame {
+@@ -58,6 +61,18 @@ function totalListeners(): number {
+   return n
+ }
+ 
++/** Core already cleaned these (tier0_track_consumer.clean_keypoints);
++ *  this only refuses what would draw nonsense if it ever did not. */
++function toKeypoints(raw: unknown): [number, number, number][] | undefined {
++  if (!Array.isArray(raw) || raw.length === 0) return undefined
++  const out: [number, number, number][] = []
++  for (const p of raw) {
++    const v = Array.isArray(p) ? [Number(p[0]), Number(p[1]), Number(p[2])] : []
++    out.push(v.length === 3 && v.every(Number.isFinite) ? [v[0], v[1], v[2]] : [0, 0, 0])
++  }
++  return out
++}
++
+ /** Accepts both the Tier-0 bridge shape (`tracks[].box` as [x,y,w,h]) and
+  *  the adapter contract's detection shape (`detections[].bbox` as
+  *  {x,y,w,h}), so a BYOM model's live results draw too. */
+@@ -71,12 +86,14 @@ function toFrame(evt: any): OverlayFrame | null {
+     for (const t of p.tracks) {
+       const b = t?.box
+       if (!Array.isArray(b) || b.length !== 4) continue
++      const keypoints = toKeypoints(t.keypoints)
+       out.push({
+         id: t.id ?? null,
+         label: String(t.label ?? 'object'),
+         score: t.score == null ? null : Number(t.score) || 0,
+         box: [Number(b[0]), Number(b[1]), Number(b[2]), Number(b[3])],
+         stationary: Boolean(t.stationary),
++        ...(keypoints ? { keypoints } : {}),
+       })
+     }
+   } else if (evt.event_type === 'inference_result' && Array.isArray(p.detections)) {
+diff --git a/app/src/lib/verticalIcons.tsx b/app/src/lib/verticalIcons.tsx
+index 586eb1c6..b4364d10 100644
+--- a/app/src/lib/verticalIcons.tsx
++++ b/app/src/lib/verticalIcons.tsx
+@@ -10,13 +10,14 @@
+ import type { ReactNode } from 'react'
+ import {
+   BellRing, Boxes, Briefcase, Car, DoorOpen, GitCommitHorizontal, Hourglass,
+-  PackageCheck, ShieldAlert, ShieldCheck, UserRound, Users,
++  PackageCheck, PersonStanding, ShieldAlert, ShieldCheck, UserRound, Users,
+ } from 'lucide-react'
+ 
+ const ICONS: Record<string, (size: number) => ReactNode> = {
+   '/vehicles': (s) => <Car size={s} />,
+   '/occupancy': (s) => <Users size={s} />,
+   '/guard-compliance': (s) => <ShieldCheck size={s} />,
++  '/falls': (s) => <PersonStanding size={s} />,
+   '/people': (s) => <UserRound size={s} />,
+   '/tripwires': (s) => <GitCommitHorizontal size={s} />,
+   '/loitering': (s) => <Hourglass size={s} />,
+diff --git a/app/src/main.tsx b/app/src/main.tsx
+index 7a2d23b4..2973dba2 100644
+--- a/app/src/main.tsx
++++ b/app/src/main.tsx
+@@ -93,6 +93,7 @@ const Gates = lazy(reloadOnStale(() => import('./views/Gates').then((m) => ({ de
+ const Notifications = lazy(reloadOnStale(() => import('./views/Notifications').then((m) => ({ default: m.Notifications }))))
+ const Search =lazy(reloadOnStale(() => import('./views/Search').then((m) => ({ default: m.Search }))))
+ const GuardCompliance = lazy(reloadOnStale(() => import('./views/GuardCompliance')))
++const FallDetection = lazy(reloadOnStale(() => import('./views/FallDetection').then((m) => ({ default: m.FallDetection }))))
+ const Settings = lazy(reloadOnStale(() => import('./views/Settings').then((m) => ({ default: m.Settings }))))
+ const Events = lazy(reloadOnStale(() => import('./views/Events').then((m) => ({ default: m.Events }))))
+ const Updates = lazy(reloadOnStale(() => import('./views/Updates').then((m) => ({ default: m.Updates }))))
+@@ -185,6 +186,7 @@ const router = createBrowserRouter([
+           { path: 'gates', element: <Gates /> },
+           { path: 'notifications', element: <Notifications /> },
+           { path: 'guard-compliance', element: <GuardCompliance /> },
++          { path: 'falls', element: <FallDetection /> },
+           { path: 'rbac/*', element: <AccessControl /> },
+           { path: 'byok', element: <BYOK /> },
+           { path: 'network/*', element: <NetworkView /> },
+diff --git a/examples/camera-agent/tasks.yml b/examples/camera-agent/tasks.yml
+index db2bc17b..de2f4094 100644
+--- a/examples/camera-agent/tasks.yml
++++ b/examples/camera-agent/tasks.yml
+@@ -209,6 +209,23 @@
+     ram_gb: 1
+     gpu: optional
+ 
++- task: fall_detection
++  label: Fall Detection
++  summary: Decides whether a person has fallen, from their pose over the last few seconds — not from a single frame, so lying down is not a fall but going down is.
++  categories: [vision, safety]
++  tags: [fall, pose, keypoints, elderly, safety, temporal]
++  agent_skill: null
++  aliases: [fall, person_fall, fall-detection]
++  suggested_adapters: [fall-detection]
++  suggested_apps: [fall-detection]
++  hardware:
++    min: 4-core CPU, ~1 GB RAM
++    note: Pose at 640 px plus a small transformer; ~60-90 ms a frame on CPU, so one camera at 10 fps per adapter instance.
++    # Structured, for the catalog's fit badge (services/hardware_profile.py):
++    cores: 4
++    ram_gb: 1
++    gpu: optional
++
+ - task: package_detection
+   label: Package Detection
+   summary: Finds parcels — boxes, padded mailers, envelopes — left at a door or on a step. COCO has no package class; this task is what fills the gap.
+diff --git a/sdk/opennvr-app-sdk/opennvr_app_sdk/validate.py b/sdk/opennvr-app-sdk/opennvr_app_sdk/validate.py
+index 88ebbac7..ca0610d6 100644
+--- a/sdk/opennvr-app-sdk/opennvr_app_sdk/validate.py
++++ b/sdk/opennvr-app-sdk/opennvr_app_sdk/validate.py
+@@ -63,7 +63,7 @@ KNOWN_TASKS = frozenset({
+     "object_detection", "face_recognition", "image_captioning", "vqa", "face_detection",
+     "person_detection", "license_plate_recognition", "multi_object_tracking",
+     "speech_to_text", "text_to_speech", "pose_estimation", "package_detection",
+-    "embed", "open_vocab_detection",
++    "embed", "open_vocab_detection", "fall_detection",
+ })
+ KNOWN_PARAM_TYPES = frozenset({"str", "int", "float", "bool", "list", "dict", "json",
+                                "geometry.polygon", "geometry.tripwire", "image", "time_range"})
+diff --git a/server/config/tasks.yml b/server/config/tasks.yml
+index ede17323..26e8e124 100644
+--- a/server/config/tasks.yml
++++ b/server/config/tasks.yml
+@@ -213,6 +213,23 @@
+     ram_gb: 1
+     gpu: optional
+ 
++- task: fall_detection
++  label: Fall Detection
++  summary: Decides whether a person has fallen, from their pose over the last few seconds — not from a single frame, so lying down is not a fall but going down is.
++  categories: [vision, safety]
++  tags: [fall, pose, keypoints, elderly, safety, temporal]
++  agent_skill: null
++  aliases: [fall, person_fall, fall-detection]
++  suggested_adapters: [fall-detection]
++  suggested_apps: [fall-detection]
++  hardware:
++    min: 4-core CPU, ~1 GB RAM
++    note: Pose at 640 px plus a small transformer; ~60-90 ms a frame on CPU, so one camera at 10 fps per adapter instance.
++    # Structured, for the catalog's fit badge (services/hardware_profile.py):
++    cores: 4
++    ram_gb: 1
++    gpu: optional
++
+ - task: package_detection
+   label: Package Detection
+   summary: Finds parcels — boxes, padded mailers, envelopes — left at a door or on a step. COCO has no package class; this task is what fills the gap.
+diff --git a/server/services/tier0_track_consumer.py b/server/services/tier0_track_consumer.py
+index 41ae1b73..ed788e05 100644
+--- a/server/services/tier0_track_consumer.py
++++ b/server/services/tier0_track_consumer.py
+@@ -161,6 +161,39 @@ def track_is_drawable(t: dict[str, Any], window_s: float | None = None) -> bool:
+         return False
+ 
+ 
++#: A COCO-17 skeleton is the only shape anything draws today; a cap keeps
++#: a malformed producer from shipping thousands of points per box.
++MAX_KEYPOINTS = 17
++
++
++def clean_keypoints(raw: Any) -> list[list[float]] | None:
++    """An app box's optional ``keypoints`` → ``[[x, y, conf], …]`` in 0..1.
++
++    Additive to ``overlay.boxes.v1`` (pose apps draw the skeleton they
++    reason about). Points must already be normalized like the box; a
++    point that is not three finite numbers is dropped rather than drawn
++    somewhere wrong, and coordinates are clamped to the frame. The slot
++    order is kept — index 9 stays the left wrist — so a dropped point
++    becomes a zero-confidence one, not a shift. ``None`` when there is
++    nothing usable."""
++    if not isinstance(raw, list) or not raw:
++        return None
++    out: list[list[float]] = []
++    usable = False
++    for point in raw[:MAX_KEYPOINTS]:
++        try:
++            x, y, c = (float(v) for v in point[:3])
++            if not all(v == v and abs(v) != float("inf") for v in (x, y, c)):
++                raise ValueError
++        except (TypeError, ValueError):
++            out.append([0.0, 0.0, 0.0])
++            continue
++        usable = True
++        clamp = lambda v: round(min(1.0, max(0.0, v)), 4)  # noqa: E731
++        out.append([clamp(x), clamp(y), clamp(c)])
++    return out if usable else None
++
++
+ def to_overlay_payload(
+     raw: dict[str, Any], *, min_score: float = DEFAULT_MIN_SCORE
+ ) -> dict[str, Any] | None:
+@@ -183,13 +216,17 @@ def to_overlay_payload(
+         box = normalize_box(t.get("box"), fw, fh)
+         if box is None:
+             continue
+-        tracks_out.append({
++        entry = {
+             "id": t.get("id"),
+             "label": str(t.get("label") or "object"),
+             "score": round(score, 3),
+             "box": box,
+             "stationary": bool(t.get("stationary", False)),
+-        })
++        }
++        keypoints = clean_keypoints(t.get("keypoints"))
++        if keypoints is not None:
++            entry["keypoints"] = keypoints
++        tracks_out.append(entry)
+     if not tracks_out:
+         return None
+     return {
+@@ -433,7 +470,8 @@ async def _handle_app_message(msg) -> None:
+                # xywh straight in silently produced boxes of the wrong size.
+                "tracks": [{"id": b.get("id"), "label": b.get("label"),
+                            "score": b.get("score", 1.0),
+-                           "box": _xywh_to_xyxy(b.get("box"))}
++                           "box": _xywh_to_xyxy(b.get("box")),
++                           "keypoints": b.get("keypoints")}
+                           for b in (payload.get("boxes") or []) if isinstance(b, dict)]}
+         out = to_overlay_payload(raw, min_score=0.0)
+         if out is None:
+diff --git a/server/tests/test_tier0_track_consumer.py b/server/tests/test_tier0_track_consumer.py
+index 833fa0e1..3032d237 100644
+--- a/server/tests/test_tier0_track_consumer.py
++++ b/server/tests/test_tier0_track_consumer.py
+@@ -430,6 +430,28 @@ def test_app_box_without_score_is_drawn():
+     assert out and out["tracks"][0]["score"] == 0.0
+ 
+ 
++def test_app_keypoints_reach_the_browser_cleaned(monkeypatch):
++    """A pose app's skeleton rides its box: normalized, clamped, slot
++    order kept (a bad point becomes zero-confidence, not a shift)."""
++    kps = [[0.1, 0.2, 0.9]] * 15 + [["x", 0.5, 0.9], [1.4, -0.2, 0.8], [0.3, 0.3, 0.3]]
++    msg = _app_msg(app="fall-detection", boxes=[
++        {"label": "Upright", "score": 0.04, "box": [0.1, 0.1, 0.2, 0.6], "keypoints": kps}])
++    out = _run_app(msg, monkeypatch, allowed=True)
++    track = out[0]["payload"]["tracks"][0]
++    assert len(track["keypoints"]) == 17                 # capped at a COCO skeleton
++    assert track["keypoints"][15] == [0.0, 0.0, 0.0]     # unparseable → invisible
++    assert track["keypoints"][16] == [1.0, 0.0, 0.8]     # clamped into the frame
++    assert track["score"] == 0.04 and track["label"] == "Upright"
++
++
++def test_boxes_without_keypoints_carry_none():
++    out = tc.to_overlay_payload(_raw([{"id": 1, "label": "person", "score": 0.9,
++                                       "box": [0, 0, 100, 100]}]))
++    assert "keypoints" not in out["tracks"][0]
++    assert tc.clean_keypoints([["a", "b", "c"]]) is None
++    assert tc.clean_keypoints(None) is None and tc.clean_keypoints([]) is None
++
++
+ def test_producer_prefix_is_stripped_for_the_lookup(monkeypatch):
+     seen = []
+     def _may(app_id, now=None):
+diff --git a/app/src/views/FallDetection.tsx b/app/src/views/FallDetection.tsx
+new file mode 100644
+index 00000000..d754aad8
+--- /dev/null
++++ b/app/src/views/FallDetection.tsx
+@@ -0,0 +1,262 @@
++// Copyright (c) 2026 OpenNVR
++// SPDX-License-Identifier: AGPL-3.0-or-later
++
++// Falls: the fall-detection app's page.
++//
++// Three things, in the order an operator needs them: the camera live,
++// with the skeleton the model is watching and its verdict drawn on it
++// (the app's overlay — DetectionOverlay draws its keypoints); where each
++// camera stands right now (score, window, frame rate, what is wrong);
++// and the falls themselves, with the frame that raised each one.
++//
++// Everything here is read from what already exists: the app's /state
++// through core's status proxy, the alert inbox filtered to this app, and
++// the live overlay every app's boxes ride. No backend of its own.
++
++import { useMemo, useState } from 'react'
++import { useQuery } from '@tanstack/react-query'
++import { PersonStanding, RefreshCw } from 'lucide-react'
++import { apiService } from '../lib/apiService'
++import {
++  Badge, Button, Card, CardContent, CardHeader, CardTitle, EmptyState, PageHeader,
++  type BadgeVariant,
++} from '../components/ui'
++import { AlarmsTable } from '../components/alarms/AlarmsTable'
++import { useAckAlarms, useAlarmsList } from '../components/alarms/useAlarmsList'
++import type { RegisteredApp } from './AppCatalog'
++import { AppCamerasCard } from './apps/AppCamerasCard'
++import { AppQueryError } from './apps/AppQueryError'
++import { AppConfigureButton, AppPageHeader } from './apps/AppSetup'
++import { useAppCameras } from './apps/CameraPicker'
++import { LiveCameraPanel } from './guardscan/LiveCameraPanel'
++
++export const FALLS_CAPABILITY = 'falls'
++const SOURCE = 'fall-detection'
++const TITLE = 'Falls'
++const DESCRIPTION = 'Who fell, where, and the frame that showed it — with the skeleton the model is watching, live.'
++
++type CameraState = {
++  camera: string
++  fps: number
++  score: number | null
++  window: string
++  fallen: boolean
++  last_fall: string
++  error: string
++}
++type FallState = { falls_today?: number; cameras?: CameraState[]; recent?: string[] }
++type Camera = { id: number; name: string }
++
++export function findFallApp(apps: RegisteredApp[] | undefined): RegisteredApp | null {
++  return (
++    (apps ?? []).find(
++      (a) => a.enabled && ((a.manifest as any)?.provides ?? []).includes(FALLS_CAPABILITY),
++    ) ?? null
++  )
++}
++
++function idFromHandle(handle: string): number | null {
++  const m = /^cam-?(\d+)$/.exec(handle)
++  return m ? Number(m[1]) : null
++}
++
++/** The camera's verdict right now, as the overlay labels it. */
++function verdict(c: CameraState): { text: string; variant: BadgeVariant } {
++  if (c.error) return { text: 'Not watching', variant: 'warning' }
++  if (c.fallen) return { text: 'FALLEN', variant: 'critical' }
++  if (c.score == null) return { text: `Warming up ${c.window}`, variant: 'neutral' }
++  if (c.score >= 0.5) return { text: 'Fall risk', variant: 'warning' }
++  return { text: 'Upright', variant: 'success' }
++}
++
++export function FallDetection() {
++  const [liveChoice, setLiveChoice] = useState<number | null>(null)
++
++  const appsQuery = useQuery({
++    queryKey: ['apps'],
++    queryFn: async () => {
++      const { data } = await apiService.getApps()
++      return (Array.isArray(data) ? data : []) as RegisteredApp[]
++    },
++    retry: 0,
++  })
++  const app = findFallApp(appsQuery.data)
++
++  // Scores move with every frame; two seconds is as fresh as a person
++  // reading the page can use, and the picture itself is live.
++  const statusQuery = useQuery({
++    queryKey: ['app-status', app?.id],
++    queryFn: async () => {
++      const { data } = await apiService.getAppStatus(app!.id)
++      return data as { state?: FallState }
++    },
++    enabled: Boolean(app),
++    retry: 0,
++    refetchInterval: 2000,
++  })
++  const state: FallState = statusQuery.data?.state ?? {}
++
++  const camerasQuery = useQuery({
++    queryKey: ['cameras'],
++    queryFn: async () => {
++      const { data } = await apiService.getCameras()
++      const list = Array.isArray(data) ? data : (data as any)?.cameras
++      return (Array.isArray(list) ? list : []) as Camera[]
++    },
++    enabled: Boolean(app),
++    retry: 0,
++  })
++  const cameraName = (handle: string) => {
++    const id = idFromHandle(handle)
++    return camerasQuery.data?.find((c) => c.id === id)?.name ?? handle
++  }
++
++  // Live video only for cameras this app watches: another camera's
++  // picture would carry no skeleton and no verdict.
++  const picksQuery = useAppCameras(app?.id ?? '', Boolean(app) && app?.camera_picker !== false)
++  const picked = useMemo(
++    () => (picksQuery.data?.cameras ?? []).filter((c) => c.picked).map((c) => ({ id: c.id, name: c.name })),
++    [picksQuery.data],
++  )
++  // The camera to show: the one chosen, else one in alarm, else the first.
++  const fallenId = (state.cameras ?? []).filter((c) => c.fallen).map((c) => idFromHandle(c.camera))[0]
++  const liveId =
++    picked.some((c) => c.id === liveChoice) ? liveChoice
++      : picked.some((c) => c.id === fallenId) ? (fallenId as number)
++      : picked[0]?.id ?? null
++
++  const alarms = useAlarmsList({
++    queryKeyPrefix: 'fall-alarms', sourceName: SOURCE,
++    unacked: false, severity: null, page: 1, pageSize: 10, skip: 0,
++  })
++  const ack = useAckAlarms()
++  const alarmRows = alarms.rows.filter((a) => a.source_name === SOURCE)
++
++  if (appsQuery.isError) {
++    return (
++      <section className="space-y-4">
++        <PageHeader title={TITLE} description={DESCRIPTION} />
++        <AppQueryError kind="apps" error={appsQuery.error} onRetry={() => appsQuery.refetch()} />
++      </section>
++    )
++  }
++
++  if (!appsQuery.isPending && !app) {
++    return (
++      <section className="space-y-4">
++        <PageHeader title={TITLE} description={DESCRIPTION} />
++        <EmptyState
++          icon={<PersonStanding size={28} />}
++          title="Fall Detection is not installed"
++          description="Install and enable Fall Detection from the App Catalog. It needs the fall-detection adapter and its two model files — see examples/fall-detection/README.md."
++        />
++      </section>
++    )
++  }
++
++  const cameras = state.cameras ?? []
++
++  return (
++    <section className="space-y-4">
++      <AppPageHeader
++        app={app}
++        title={TITLE}
++        description={DESCRIPTION}
++        actions={
++          <>
++            <Button size="sm" variant="outline" onClick={() => { statusQuery.refetch(); alarms.refetch?.() }}>
++              <RefreshCw size={14} /> Refresh
++            </Button>
++            {app && <AppConfigureButton app={app} size="sm" />}
++          </>
++        }
++      />
++
++      <div className="grid gap-4 xl:grid-cols-3">
++        <div className="xl:col-span-2 h-[440px]">
++          <LiveCameraPanel
++            cameraId={liveId}
++            cameraName={liveId == null ? '' : picked.find((c) => c.id === liveId)?.name ?? `Camera #${liveId}`}
++            cameras={picked}
++            onSelectCamera={setLiveChoice}
++            emptyMessage={
++              picksQuery.isLoading ? 'Loading cameras…'
++                : picked.length === 0 ? 'This app is not watching any camera yet.'
++                : undefined
++            }
++            overlayEnabled={app?.overlay_enabled}
++          />
++        </div>
++
++        <Card>
++          <CardHeader>
++            <CardTitle>Right now</CardTitle>
++          </CardHeader>
++          <CardContent className="space-y-3">
++            <div className="flex items-baseline gap-2">
++              <span className="text-3xl font-semibold tabular-nums">{state.falls_today ?? 0}</span>
++              <span className="text-xs text-[var(--text-dim)]">falls today</span>
++            </div>
++            {cameras.length === 0 ? (
++              <p className="text-xs text-[var(--text-dim)]">
++                {statusQuery.isError ? 'The app is not answering.' : 'No camera is being watched yet.'}
++              </p>
++            ) : (
++              <ul className="space-y-2">
++                {cameras.map((c) => {
++                  const v = verdict(c)
++                  const pct = c.score == null ? null : Math.round(c.score * 100)
++                  return (
++                    <li key={c.camera} className="border border-[var(--border)] p-2 text-xs">
++                      <button
++                        type="button"
++                        className="flex w-full items-center gap-2 text-left"
++                        onClick={() => { const id = idFromHandle(c.camera); if (id != null) setLiveChoice(id) }}
++                        title="Watch this camera live"
++                      >
++                        <span className="min-w-0 flex-1 truncate font-medium">{cameraName(c.camera)}</span>
++                        <Badge variant={v.variant}>{v.text}</Badge>
++                      </button>
++                      <div className="mt-1.5 h-1.5 w-full bg-[var(--bg-2)]" aria-label="Fall score">
++                        <div
++                          className={`h-full ${c.fallen || (pct ?? 0) >= 90 ? 'bg-[var(--danger)]' : (pct ?? 0) >= 50 ? 'bg-[var(--warn)]' : 'bg-[var(--ok)]'}`}
++                          style={{ width: `${pct ?? 0}%` }}
++                        />
++                      </div>
++                      <div className="mt-1 flex flex-wrap gap-x-3 text-[var(--text-dim)] tabular-nums">
++                        <span>score {pct == null ? '—' : `${pct}%`}</span>
++                        <span>{c.fps} fps</span>
++                        <span>window {c.window}</span>
++                        {c.last_fall && <span>last fall {c.last_fall}</span>}
++                      </div>
++                      {c.error && <p className="mt-1 text-[var(--warn)]">{c.error}</p>}
++                    </li>
++                  )
++                })}
++              </ul>
++            )}
++          </CardContent>
++        </Card>
++
++        <div className="xl:col-span-3">
++          <AlarmsTable
++            caption="Falls"
++            rows={alarmRows}
++            cameraLabel={(handle) => (handle ? cameraName(handle) : '—')}
++            onAck={(ids) => ack.mutate(ids)}
++            ackPending={ack.isPending}
++            isPending={alarms.isPending}
++            isFetching={alarms.isFetching}
++            isError={alarms.isError}
++            error={alarms.error}
++            emptyTitle="No falls"
++            emptyDescription="Each fall appears here as it is raised, with the frame that decided it and the skeleton drawn on it."
++            fillHeight={false}
++          />
++        </div>
++      </div>
++
++      {app && <AppCamerasCard app={app} />}
++    </section>
++  )
++}

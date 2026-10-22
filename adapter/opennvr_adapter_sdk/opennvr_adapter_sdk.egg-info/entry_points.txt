@@ -1,0 +1,2 @@
+[console_scripts]
+opennvr-adapter = opennvr_adapter_sdk.scaffold:main

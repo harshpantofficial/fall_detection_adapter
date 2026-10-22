@@ -1,24 +1,22 @@
-# Fall Detection App config for OpenNVR docker compose stack.
+# Fall detection — baked into the image. Connection settings and the key
+# come from the environment (docker-compose.yml / .env); the alarm and
+# video settings below are live-editable in the App Catalog form.
 
-nats_url: "nats://nats:4222"
-nats_token: "${INTERNAL_API_KEY}"
-
-subject_pattern: "opennvr.inference.>"
-consume_tier0: true
-
-fallen_seconds: 3.0
-alert_cooldown_seconds: 30.0
+# Alarm
+threshold: 0.90          # the model's validated threshold
+cooldown_s: 10.0         # one fall = one alarm
+min_hits: 1              # hot frames in a row before alarming
 alert_severity: "critical"
-track_ttl_seconds: 10.0
 attach_snapshot: true
-active_hours: null
+
+# Video
+fps: 10.0                # 10-15 measured to work; the model was trained on 24-30
+frame_width: 640
+hold_s: 5.0              # seconds FALLEN stays on the live view
 
 webhook_url: null
-nats_alerts_url: "nats://nats:4222"
-nats_alerts_token: "${INTERNAL_API_KEY}"
 
-# Contract server (:9210) & auto-registration with OpenNVR Core
-contract_port: 9210
+contract_port: 9212
 contract_bind_host: "0.0.0.0"
-contract_host: "fall-detection-app"
+contract_host: "fall-detection"
 opennvr_url: "http://opennvr-core:8000"

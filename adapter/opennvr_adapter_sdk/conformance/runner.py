@@ -105,6 +105,9 @@ class ConformanceRunner:
         # Pose adapters take image bytes over multipart like any other
         # vision adapter; this JSON payload is only the fallback path.
         "pose_estimation": {"conf": 0.5},
+        # Fall detection is pose plus a temporal classifier; one frame
+        # with no stream_id is a stateless call (fall.score is null).
+        "fall_detection": {"conf": 0.5},
         # Package detection is a vision task with the yolov8-style
         # params; image bytes go over multipart like the others.
         "package_detection": {"conf": 0.35},
@@ -155,6 +158,9 @@ class ConformanceRunner:
         # the check is on the wire shape and the §6 roundtrip, not on
         # the model finding anything.
         "pose_estimation": __import__("base64").b64decode(_SAMPLE_1x1_BLACK_JPEG_B64),
+        # Fall detection — same empty frame: nobody in it, and the
+        # window is one frame deep, so the score is null.
+        "fall_detection": __import__("base64").b64decode(_SAMPLE_1x1_BLACK_JPEG_B64),
         # Package detection — a 1x1 black frame holds no parcel, so the
         # adapter answers an empty §5.1 ``detections`` list; the check
         # is on the wire shape, not on finding anything.

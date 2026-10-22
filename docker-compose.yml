@@ -1,85 +1,59 @@
-# ==============================================================================
-# OpenNVR — Standalone Fall Detection System (AI Adapter + Monitoring App)
-# ==============================================================================
-# STANDALONE mode: includes its own NATS broker so this stack can run
-# independently of the full OpenNVR core stack.
+# ==========================================
+# Fall detection for OpenNVR — a standalone add-on stack
+# ==========================================
+# Two containers that plug into a RUNNING OpenNVR stack the same way its
+# own apps and adapters do, over its Docker networks:
 #
-# Run from inside fall_detection_adapter/:
+#   fall-detection-adapter   YOLO26-pose + the fall transformer (both models
+#                            baked into the image). Registered with OpenNVR's
+#                            KAI-C as "fall-detection".
+#   fall-detection           The app: watches the cameras you pick for it in
+#                            the App Catalog, raises "Person fallen" alarms,
+#                            draws its boxes on the Live View.
 #
-#   1. Set the internal API key:
-#        export INTERNAL_API_KEY=your_key_here        (Linux/macOS)
-#        set INTERNAL_API_KEY=your_key_here           (Windows cmd)
-#        $env:INTERNAL_API_KEY="your_key_here"        (PowerShell)
+# Nothing in the OpenNVR checkout changes, and OpenNVR does not need to be
+# restarted. Remove it with `docker compose down`.
 #
-#   2. Build and launch:
-#        docker compose up -d --build
+#   1. copy .env.example to .env and set INTERNAL_API_KEY (the SAME value
+#      as OpenNVR's .env) and OPENNVR_PROJECT (see .env.example)
+#   2. put the two model files in ./models (see README)
+#   3. docker compose up -d --build
 #
-# NOTE: Both 'opennvr_internal' and 'opennvr_apps' external networks must
-# exist before starting. Create them with:
-#   docker network create opennvr_internal
-#   docker network create opennvr_apps
-#
-# The fall-detection-register service polls opennvr-core:8100 (KAI-C) to
-# auto-register the adapter. In standalone mode (no OpenNVR core), it will
-# retry 40 times then exit gracefully — register manually via the UI.
-#
-# For use WITH the full OpenNVR stack, prefer docker-compose.fall.yml as an
-# overlay: docker compose -f <opennvr>/docker-compose.yml -f docker-compose.fall.yml up -d
-# ==============================================================================
+# Test cameras from video files (optional): --profile testcam, see README.
+# ==========================================
+
+name: opennvr-fall-detection
 
 services:
-  # ── 0. NATS message broker (standalone mode — not needed when using the full OpenNVR stack) ──
-  nats:
-    image: nats:2.10-alpine
-    container_name: opennvr_nats_standalone
-    restart: unless-stopped
-    command: ["--auth", "${INTERNAL_API_KEY}"]
-    ports:
-      - "4222:4222"
-    networks:
-      - opennvr_internal
-      - opennvr_apps
-    healthcheck:
-      test: ["CMD", "nats-server", "--help"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-
-  # ── 1. Fall Detection AI Adapter (GPU Accelerated) ─────────────────────────
   fall-detection-adapter:
     build:
-      context: ./adapter
-      dockerfile: Dockerfile
-    image: opennvr/fall-detection-adapter:1.0.0
+      context: .
+      dockerfile: adapter/Dockerfile
+    image: ${FALL_DETECTION_ADAPTER_IMAGE:-opennvr/fall-detection-adapter:local}
     container_name: opennvr_fall_detection_adapter
     restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
     environment:
-      - OPENNVR_ADAPTER_TOKEN=${INTERNAL_API_KEY}
-      - YOLO_POSE_WEIGHTS_DIR=/weights
-      - YOLO_POSE_WEIGHTS_PATH=/weights/yolo26n-pose.pt
-      - FALL_TRANSFORMER_TFLITE_PATH=/weights/fall_detection_transformer.tflite
-    volumes:
-      # Mount the local weights directly from fall_detection/
-      - ./fall_detection:/weights:ro
-    ports:
-      - "9010:9010"
+      # KAI-C calls adapters with the deployment's internal key.
+      - OPENNVR_ADAPTER_TOKEN=${INTERNAL_API_KEY:?set INTERNAL_API_KEY in .env (same as OpenNVR's)}
+      # The reference model's settings — see the README before changing:
+      # 448 px moves fall onset by up to seven frames.
+      - FALL_POSE_IMGSZ=${FALL_POSE_IMGSZ:-640}
+      - FALL_POSE_CONF=${FALL_POSE_CONF:-0.25}
+      - FALL_THRESHOLD=${FALL_THRESHOLD:-0.90}
     networks:
-      - opennvr_internal
+      # Where KAI-C (opennvr-core:8100) reaches adapters.
+      opennvr_internal:
+        aliases: [fall-detection-adapter]
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx, sys; sys.exit(0 if httpx.get('http://127.0.0.1:9010/health', timeout=2).status_code == 200 else 1)"]
+      test: ["CMD", "python", "-c", "import httpx, sys; sys.exit(0 if httpx.get('http://127.0.0.1:9013/health', timeout=2).status_code == 200 else 1)"]
       interval: 15s
       timeout: 5s
       start_period: 60s
-      retries: 5
+      retries: 20
 
-  # ── 2. One-shot Adapter Auto-Registration with OpenNVR Core (KAI-C) ────────
+  # One-shot: tell KAI-C the adapter exists and grant its declared
+  # permissions — the same job OpenNVR's own *-register services do.
+  # Re-run it any time with `docker compose up fall-detection-register`.
   fall-detection-register:
     image: alpine:3.20
     container_name: opennvr_fall_detection_register
@@ -87,8 +61,6 @@ services:
     depends_on:
       fall-detection-adapter:
         condition: service_healthy
-    networks:
-      - opennvr_internal
     environment:
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
     command:
@@ -97,65 +69,105 @@ services:
       - |
         set -e
         name="fall-detection"
-        url="http://fall-detection-adapter:9010"
-        echo "Attempting to auto-register '$$name' -> $$url with OpenNVR Core (KAI-C)..."
+        url="http://fall-detection-adapter:9013"
+        echo "Registering '$$name' -> $$url with KAI-C (opennvr-core:8100)..."
         i=0
-        while [ $$i -lt 40 ]; do
+        while [ $$i -lt 60 ]; do
           if wget -q -O- \
                --header="Content-Type: application/json" \
                --header="X-Internal-Api-Key: $${INTERNAL_API_KEY}" \
                --post-data="{\"name\":\"$$name\",\"url\":\"$$url\"}" \
                http://opennvr-core:8100/api/v1/adapters/register >/dev/null 2>&1; then
-            echo "Successfully registered adapter '$$name' with OpenNVR!"
-            wget -q -O- \
+            echo "Registered '$$name'."
+            if wget -q -O- \
                  --header="X-Internal-Api-Key: $${INTERNAL_API_KEY}" \
+                 --header="X-Actor: install" \
                  --post-data="" \
-                 "http://opennvr-core:8100/api/v1/adapters/$$name/permissions/approve-all" >/dev/null 2>&1 || true
+                 "http://opennvr-core:8100/api/v1/adapters/$$name/permissions/approve-all" >/dev/null 2>&1; then
+              echo "Approved '$$name' declared permissions."
+            else
+              echo "WARN: could not approve '$$name' permissions - grant them on the AI models page." >&2
+            fi
             exit 0
           fi
-          i=$$((i+1))
-          echo "Waiting for opennvr-core:8100 to accept registration ($$i/40)..."
-          sleep 3
+          i=$$((i+1)); echo "attempt $$i/60 failed (is OpenNVR running, and INTERNAL_API_KEY the same?); retry in 5s"; sleep 5
         done
-        echo "WARN: Timed out auto-registering. You can register it in the OpenNVR UI: Settings -> AI Models" >&2
-        exit 0
+        echo "ERROR: could not register '$$name' with KAI-C." >&2
+        exit 1
+    networks:
+      - opennvr_internal
 
-  # ── 3. Fall Detection Monitoring App ───────────────────────────────────────
-  fall-detection-app:
+  fall-detection:
     build:
-      context: ./app
-      dockerfile: Dockerfile
-    image: opennvr/fall-detection-app:1.0.0
-    container_name: opennvr_fall_detection_app
+      context: .
+      dockerfile: app/Dockerfile
+    image: ${FALL_DETECTION_IMAGE:-opennvr/fall-detection:local}
+    container_name: opennvr_fall_detection
     restart: unless-stopped
     depends_on:
-      nats:
-        condition: service_healthy
       fall-detection-adapter:
         condition: service_healthy
+      fall-detection-register:
+        condition: service_completed_successfully
     environment:
       - OPENNVR_INTERNAL_API_KEY=${INTERNAL_API_KEY}
-      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
-      - NATS_URL=nats://nats:4222
       - OPENNVR_URL=http://opennvr-core:8000
-      # Internal MediaMTX address reachable from inside Docker (for HLS proxy).
-      - MEDIAMTX_INTERNAL_URL=${MEDIAMTX_INTERNAL_URL:-http://mediamtx:8189}
-    volumes:
-      - ./app/config.docker.yml:/app/config.yml:ro
-    ports:
-      - "9210:9210"
+      - KAIC_URL=http://opennvr-core:8100
+      - NATS_ALERTS_URL=nats://nats-apps:4222
+      # The apps network has no route out; nothing here needs one.
+      - NO_PROXY=opennvr-core,nats,nats-apps,egress-proxy,mediamtx,localhost,127.0.0.1
+    expose:
+      - "9212"
     networks:
-      - opennvr_apps
-      - opennvr_internal
-      - opennvr_default
+      # Where OpenNVR apps live: core, the apps bus and MediaMTX reach it
+      # (and it them) as "fall-detection".
+      opennvr_apps:
+        aliases: [fall-detection]
 
+  # ── Test cameras from video files (opt-in: --profile testcam) ──
+  # Every file in ./test-videos becomes a looping RTSP camera at
+  # rtsp://${TESTCAM_IP}:8554/<file name>, on OpenNVR's internal network.
+  # Register them as OpenNVR cameras with testcam/register_test_cameras.py
+  # (README). Plaintext, no auth, internal network only — a test rig.
+  fall-testcam:
+    profiles: [testcam]
+    image: bluenviron/mediamtx:1.15.4-ffmpeg
+    container_name: opennvr_fall_testcam
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/opt/fakecams/entrypoint.sh"]
+    environment:
+      - FAKECAM_VIDEO_DIR=/videos
+      # Re-encode with clean keyframes at every loop seam.
+      - FAKECAM_MODE=transcode
+      - FAKECAM_FPS=${TESTCAM_FPS:-}
+      # Each video is its own camera.
+      - FAKECAM_GROUP=file
+      - FAKECAM_SCAN_INTERVAL=5
+    volumes:
+      - ./testcam/entrypoint.sh:/opt/fakecams/entrypoint.sh:ro
+      - ./test-videos:/videos:ro
+    networks:
+      opennvr_internal:
+        # Static, because an OpenNVR camera stores an IP address. Inside
+        # OpenNVR's internal subnet (default 172.28.0.0/16), away from
+        # OpenNVR's own fake-camera rig (172.28.90.10).
+        ipv4_address: ${TESTCAM_IP:-172.28.90.20}
+        aliases: [fall-testcam]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8554"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+# OpenNVR's own networks, joined from outside. Compose names them
+# <project>_opennvr_internal / <project>_opennvr_apps, where <project> is
+# OpenNVR's compose project — the name of its checkout folder unless it
+# was started with -p. `docker network ls` shows the real names.
 networks:
   opennvr_internal:
     external: true
-    name: open-nvr_opennvr_internal
+    name: ${OPENNVR_PROJECT:-open-nvr}_opennvr_internal
   opennvr_apps:
     external: true
-    name: open-nvr_opennvr_apps
-  opennvr_default:
-    external: true
-    name: open-nvr_default
+    name: ${OPENNVR_PROJECT:-open-nvr}_opennvr_apps
