@@ -86,9 +86,25 @@ Remove the test cameras in OpenNVR's Cameras page, then run `docker compose --pr
 ```powershell
 # the adapter answers the contract (both models loaded)
 docker exec opennvr_fall_detection_adapter python -m opennvr_adapter_sdk.conformance http://127.0.0.1:9013 --token <INTERNAL_API_KEY>
-# the app's live state
+# the app's live state: per-camera fps/score/window, and "overlay": publishes ok / failed
 docker exec opennvr_fall_detection python -c "import httpx; print(httpx.get('http://127.0.0.1:9212/state').text)"
 ```
+
+### No boxes on Live View?
+
+The boxes pass through four places: the app, the apps bus, core's overlay gate, and the browser socket. This script runs inside OpenNVR's core container, watches each hop for 10 s, and says which one is failing. It only reads; it changes nothing and prints no keys:
+
+```powershell
+Get-Content -Raw tools\diagnose_overlay.py | docker exec -i opennvr_core python -
+```
+
+The usual causes, in order:
+
+1. **Allow drawing** not pressed (App Catalog → Fall Detection → Overlay).
+2. The camera you are watching is not picked for the app.
+3. The **Detections** button in Live View is off.
+
+If the script shows the app's events never reaching the bus, look at the `overlay` block in `/state` and at `docker logs opennvr_fall_detection`.
 
 ## What you get on a stock (pulled) OpenNVR core
 

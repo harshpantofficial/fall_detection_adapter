@@ -434,6 +434,12 @@ class FallDetectionApp(FrameApp):
         self.falls_today = 0
         self._day = time.strftime("%Y-%m-%d")
         self.recent: list[str] = []
+        #: Overlay publishes, counted: the overlay is fire-and-forget, so
+        #: without these a bus refusing every box looks like a healthy app
+        #: whose boxes simply never appear.
+        self._overlay_lock = threading.Lock()
+        self.overlay = {"published": 0, "failed": 0, "last_ok_at": None,
+                        "last_error": None, "last_boxes": 0}
         dispatcher = build_dispatcher(
             webhook_url=getattr(config, "webhook_url", None),
             nats_alerts_url=getattr(config, "nats_alerts_url", None),
@@ -530,14 +536,37 @@ class FallDetectionApp(FrameApp):
         return {"scene": path} if path else {}
 
     def publish_overlay(self, handle: str, boxes: list[dict], frame) -> None:
+        """Hand this frame's boxes to the bus, and count what happened.
+
+        ``publish_overlay`` never raises on bus trouble; it returns False.
+        That return value used to be dropped, so a refused or dead bus
+        connection meant no boxes and no trace of why."""
+        error = None
         try:
-            self.events.publish_overlay(camera_id=handle, boxes=boxes, seq=frame.seq)
-        except Exception:  # noqa: BLE001
-            log.debug("overlay publish failed", exc_info=True)
+            ok = self.events.publish_overlay(camera_id=handle, boxes=boxes, seq=frame.seq)
+            if ok is False:
+                error = "the bus did not accept the overlay (see the NATS lines in this log)"
+        except Exception as exc:  # noqa: BLE001
+            error = f"{exc.__class__.__name__}: {exc}"
+        with self._overlay_lock:
+            o = self.overlay
+            o["last_boxes"] = len(boxes)
+            if error is None:
+                o["published"] += 1
+                o["last_ok_at"] = time.strftime("%H:%M:%S")
+                return
+            o["failed"] += 1
+            o["last_error"] = error
+            failed = o["failed"]
+        if failed in (1, 10, 100) or failed % 1000 == 0:
+            log.warning("%s: overlay publish failed (#%d): %s", handle, failed, error)
 
     # ── state the catalog and the Falls page show ──
 
-    def state(self) -> dict:
+    def state_snapshot(self) -> dict:
+        """``GET /state`` — what the catalog and the Falls page show. The
+        SDK's contract server calls THIS name; a method called ``state``
+        is never reached, and /state answers ``{}``."""
         cameras = []
         for handle, w in self._workers():
             error = w.last_error or ""
@@ -554,8 +583,10 @@ class FallDetectionApp(FrameApp):
                 "last_fall": w.last_fall,
                 "error": error,
             })
+        with self._overlay_lock:
+            overlay = dict(self.overlay)
         return {"falls_today": self.falls_today, "cameras": cameras,
-                "recent": list(reversed(self.recent))}
+                "recent": list(reversed(self.recent)), "overlay": overlay}
 
     def not_ready_reason(self) -> str | None:
         workers = self._workers()

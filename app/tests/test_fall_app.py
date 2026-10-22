@@ -210,3 +210,46 @@ def test_manifest_requires_its_own_task_not_pose_estimation():
     page (appVerticals' legacy rule) for this app."""
     assert fd.MANIFEST.requires_tasks == ["fall_detection"]
     assert fd.MANIFEST.provides == ["falls"] and fd.MANIFEST.overlay
+
+
+# ── what /state and the overlay report ──
+
+
+def _bare_app():
+    app = fd.FallDetectionApp.__new__(fd.FallDetectionApp)
+    app.config = fd.FallConfig()
+    app.falls_today, app._day, app.recent = 0, fd.time.strftime("%Y-%m-%d"), []
+    app._overlay_lock = fd.threading.Lock()
+    app.overlay = {"published": 0, "failed": 0, "last_ok_at": None,
+                   "last_error": None, "last_boxes": 0}
+    app.workers, app._workers_lock = {}, fd.threading.Lock()
+    return app
+
+
+def test_state_is_served_through_the_name_the_sdk_calls():
+    """The contract server serves ``state_snapshot``; an app method named
+    anything else leaves GET /state answering {} (the field report)."""
+    from opennvr_app_sdk.contract import ContractMixin
+
+    assert fd.FallDetectionApp.state_snapshot is not ContractMixin.state_snapshot
+    snap = _bare_app().state_snapshot()
+    assert set(snap) >= {"falls_today", "cameras", "recent", "overlay"}
+
+
+def test_overlay_publish_outcomes_are_counted_not_swallowed(caplog):
+    app = _bare_app()
+    replies = iter([True, False, RuntimeError("nats down"), True])
+
+    def publish_overlay(**kw):
+        r = next(replies)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    app.events = SimpleNamespace(publish_overlay=publish_overlay)
+    for _ in range(4):
+        app.publish_overlay("cam3", [{"label": "person"}], frame(1))
+    o = app.state_snapshot()["overlay"]
+    assert (o["published"], o["failed"], o["last_boxes"]) == (2, 2, 1)
+    assert "nats down" in o["last_error"]
+    assert "overlay publish failed" in caplog.text
