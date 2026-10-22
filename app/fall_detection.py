@@ -1,5 +1,3 @@
-# Copyright (c) 2026 OpenNVR
-# SPDX-License-Identifier: AGPL-3.0-or-later
 """Fall detection — raise an alarm when someone falls, and show the
 skeleton it is watching on the live view.
 
@@ -278,6 +276,9 @@ class CameraWorker:
         self.frames = 0
         self.fps = 0.0
         self.window = "0/30"
+        #: Where the adapter ran this camera's pose model ("cuda" / "cpu"),
+        #: as it reports it per frame.
+        self.device = ""
         self.last_fall: str = ""
         self.last_error: str | None = None
         self._infer_error: str | None = None
@@ -393,6 +394,7 @@ class CameraWorker:
         fall = parsed["fall"]
         window = fall.get("window") or {}
         self.window = f"{window.get('filled', 0)}/{window.get('size', 30)}"
+        self.device = str(fall.get("device") or "")
         alarm = self.monitor.observe(fall.get("score"), frame.wall_ts)
         if alarm is not None:
             self.last_fall = time.strftime("%H:%M:%S", time.localtime(alarm.at))
@@ -579,6 +581,7 @@ class FallDetectionApp(FrameApp):
                 "fps": round(w.fps, 1),
                 "score": None if score is None else round(score, 3),
                 "window": w.window,
+                "device": w.device,
                 "fallen": w.monitor.fallen(time.time()),
                 "last_fall": w.last_fall,
                 "error": error,

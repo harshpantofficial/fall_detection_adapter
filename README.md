@@ -53,6 +53,30 @@ docker compose logs fall-detection-register        # "Registered 'fall-detection
 docker compose logs -f fall-detection              # "watching camN" once cameras are picked
 ```
 
+**3b. On an NVIDIA GPU (optional, recommended).** Requirements: a current NVIDIA driver on Windows (535 or newer) and Docker Desktop on the WSL 2 backend. First check that Docker can see the GPU:
+
+```powershell
+docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu22.04 nvidia-smi
+```
+
+Then build and start with the GPU layer instead of step 3:
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+docker compose logs fall-detection-adapter | Select-String "pose model on"   # -> "pose model on GPU"
+```
+
+This puts the pose model on CUDA. The image includes the CUDA 12 and cuDNN 9 libraries (about 3 GB more). The fall transformer stays on CPU (about 1 ms per window), and the app needs no GPU.
+
+If CUDA cannot start, the adapter keeps working on CPU rather than failing, and says so in three places:
+- a warning in its log;
+- `warn` on the AI models page;
+- `"device": "cpu"` per camera in the app's `/state` (`"cuda"` when it is on the GPU).
+
+With the GPU's headroom, raise the app's **`fps`** to 15–25 in the App Catalog. The model was trained on 24–30 fps video, so a higher frame rate is closer to what it learned, and one adapter can then serve several cameras.
+
+To go back to CPU: `docker compose up -d --build` (without the GPU file).
+
 **4. In OpenNVR's UI.**
 
 1. **App Catalog → Fall Detection.** The app registers itself.
@@ -162,7 +186,7 @@ At the app's 10 fps, the full app and adapter raised exactly one alarm on each o
 - **One person per camera.** The model scores the largest person in view; others are drawn as plain `person` boxes.
 - **Frame rate.** It was trained on 24–30 fps video. 10–15 fps is measured to work; below about 6 fps a fall is too few frames of the window, and the app's state says so.
 - **3 s blind after a (re)connect.** At 10 fps the window needs 30 frames before the first score.
-- **CPU.** 60–90 ms a frame at 640 px on an 8-core laptop, so about one camera at 10 fps per adapter. More cameras means more adapter instances, or lower `fps`.
+- **CPU.** 60–90 ms a frame at 640 px on an 8-core laptop, so about one camera at 10 fps per adapter. On an NVIDIA GPU (`docker-compose.gpu.yml`) the pose model is several times faster; measure it on your card.
 
 ## Remove
 

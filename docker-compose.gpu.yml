@@ -1,0 +1,35 @@
+# ==========================================
+# Fall detection — run the adapter's pose model on an NVIDIA GPU
+# ==========================================
+# Layered on top of docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#
+# Needs, on the host: an NVIDIA GPU, a current NVIDIA driver (Windows:
+# the normal Game Ready / Studio driver, 535 or newer), and Docker Desktop
+# on the WSL 2 backend — which passes the GPU into containers itself, no
+# separate toolkit to install. Check first:
+#
+#   docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu22.04 nvidia-smi
+#
+# What runs on the GPU: YOLO26-pose (onnxruntime CUDA). The fall
+# transformer stays on CPU (~1 ms a window) and the app needs no GPU.
+# If CUDA cannot start, onnxruntime falls back to CPU — the adapter says
+# so in its log and in every result's fall.device ("cuda" / "cpu"), which
+# the app shows per camera in its /state.
+
+services:
+  fall-detection-adapter:
+    build:
+      args:
+        ORT_PACKAGE: "onnxruntime-gpu[cuda,cudnn]==1.23.2"
+    image: ${FALL_DETECTION_ADAPTER_GPU_IMAGE:-opennvr/fall-detection-adapter:gpu}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # One GPU is plenty for this model; set FALL_GPU_DEVICE to
+              # pin a specific one on a multi-GPU box.
+              device_ids: ["${FALL_GPU_DEVICE:-0}"]
+              capabilities: [gpu]

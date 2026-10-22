@@ -52,6 +52,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# CPU (default) or GPU onnxruntime for the pose model. The GPU build is
+# docker-compose.gpu.yml: onnxruntime-gpu with the CUDA 12 + cuDNN 9
+# libraries as pip wheels (~3 GB), so no CUDA base image is needed — the
+# host's NVIDIA driver is injected by Docker when the GPU is requested.
+ARG ORT_PACKAGE="onnxruntime==1.23.2"
+
 # The yolo-pose adapter's pin set (its code runs here) plus LiteRT for the
 # classifier, the runtime the reference Space uses, so the .tflite runs
 # unconverted. websockets: without it /infer/stream 404s while /health
@@ -65,7 +71,7 @@ RUN pip install --no-cache-dir \
         websockets==17.1 \
         numpy==1.26.4 \
         opencv-python-headless==4.10.0.84 \
-        onnxruntime==1.23.2 \
+        "${ORT_PACKAGE}" \
         ai-edge-litert==2.3.0
 
 COPY adapter/opennvr_adapter_sdk/ ./opennvr_adapter_sdk/

@@ -307,3 +307,44 @@ def test_metrics_count_scored_frames(svc):
         svc._infer_image_bytes(b"j", {"stream_id": "a"})
     text = svc.metrics.render() if hasattr(svc.metrics, "render") else str(svc.metrics)
     assert "adapter_fall_scores_total" in text
+
+
+# ── GPU: where the pose model actually ran ──────────────────────────
+
+
+def test_results_say_which_device_ran_the_pose_model(svc):
+    assert svc._infer_image_bytes(b"j", {}).result["fall"]["device"] == "cpu"
+    svc._gpu_in_use = True
+    assert svc._infer_image_bytes(b"j", {}).result["fall"]["device"] == "cuda"
+
+
+def test_gpu_build_that_fell_back_to_cpu_is_a_warning(svc, monkeypatch):
+    """onnxruntime falls back to CPU without failing; the operator who
+    deployed the GPU image must not have to guess."""
+    from opennvr_adapter_sdk.contract import HardwareVerdict
+
+    monkeypatch.setattr(S, "_cuda_build", lambda: True)
+    report = svc.hardware_evaluation()
+    assert report.verdict == HardwareVerdict.WARN and "fell back to CPU" in report.reasoning
+    assert report.details["pose_device"] == "cpu"
+    svc._gpu_in_use = True
+    report = svc.hardware_evaluation()
+    assert report.verdict != HardwareVerdict.WARN or "fell back" not in report.reasoning
+    assert report.details["pose_device"] == "cuda"
+
+
+def test_cpu_build_on_cpu_is_not_a_warning(svc, monkeypatch):
+    monkeypatch.setattr(S, "_cuda_build", lambda: False)
+    assert "fell back" not in (svc.hardware_evaluation().reasoning or "")
+
+
+def test_cuda_libraries_are_preloaded_only_on_the_gpu_build(monkeypatch):
+    import onnxruntime as ort
+
+    calls = []
+    monkeypatch.setattr(ort, "preload_dlls", lambda *a, **k: calls.append(1), raising=False)
+    monkeypatch.setattr(ort, "get_available_providers", lambda: ["CPUExecutionProvider"])
+    assert S._prepare_cuda() is False and calls == []
+    monkeypatch.setattr(ort, "get_available_providers",
+                        lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    assert S._prepare_cuda() is True and calls == [1]

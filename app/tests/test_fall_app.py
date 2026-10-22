@@ -32,7 +32,8 @@ def message(score=None, persons=None, subject=0, filled=30):
         "persons": persons, "frame_dimensions": {"w": W, "h": H},
         "fall": {"score": score, "detected": score is not None and score >= 0.9,
                  "threshold": 0.9, "subject_index": subject if persons else None,
-                 "window": {"filled": filled, "size": 30}, "stateful": True}}}
+                 "window": {"filled": filled, "size": 30}, "stateful": True,
+                 "device": "cuda"}}}
 
 
 # ── parse_result ──
@@ -143,6 +144,7 @@ def test_a_fall_run_raises_one_alarm_and_draws_every_frame():
     assert len(app.overlays) == len(scores)
     assert app.overlays[-1][1][0]["label"] == "FALLEN"
     assert w.window == "30/30"
+    assert w.device == "cuda"
 
 
 def test_three_failures_mark_the_camera_down_and_a_reply_recovers_it(monkeypatch):

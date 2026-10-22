@@ -141,7 +141,10 @@ class FallDetectionService(YoloPoseService):
 
     def load(self) -> None:
         """Both models, or not ready. Idempotent."""
+        cuda_build = _prepare_cuda()
         super().load()
+        if super().is_ready():
+            self._report_device(cuda_build)
         if self._classifier_state == HealthStatus.OK:
             return
         self.metrics.register_counter(
@@ -174,6 +177,26 @@ class FallDetectionService(YoloPoseService):
             self._classifier_state = HealthStatus.ERROR
             self._classifier_error = str(exc)
             logger.exception("fall classifier failed to load %s", self._classifier_path)
+
+    @property
+    def device(self) -> str:
+        """Where pose actually runs: "cuda" or "cpu". onnxruntime falls
+        back to CPU without failing when CUDA cannot start (no GPU passed
+        to the container, driver too old), so this is read from the
+        session, never assumed from the build."""
+        return "cuda" if self._gpu_in_use else "cpu"
+
+    def _report_device(self, cuda_build: bool) -> None:
+        if self._gpu_in_use:
+            logger.info("pose model on GPU (CUDAExecutionProvider)")
+        elif cuda_build:
+            logger.warning(
+                "This is the GPU build, but the pose model is running on CPU: "
+                "CUDA did not start. Is the GPU passed to the container "
+                "(docker-compose.gpu.yml) and the NVIDIA driver installed on "
+                "the host? `docker exec <adapter> nvidia-smi` should list it.")
+        else:
+            logger.info("pose model on CPU (CPU build of onnxruntime)")
 
     def is_ready(self) -> bool:
         return super().is_ready() and self._classifier_state == HealthStatus.OK
@@ -229,8 +252,17 @@ class FallDetectionService(YoloPoseService):
             "default_imgsz": self._pose_imgsz,
             "fall_threshold": self._threshold,
             "window_frames": TIMESTEPS,
+            "pose_device": self.device,
+            # The classifier is ~1 ms on CPU, and LiteRT's Python wheel has
+            # no CUDA delegate on Linux; the GPU is spent where it pays.
+            "classifier_device": "cpu",
         })
         update: dict[str, Any] = {"details": details}
+        if self._load_state == HealthStatus.OK and not self._gpu_in_use and _cuda_build():
+            from opennvr_adapter_sdk.contract import HardwareVerdict
+            update["verdict"] = HardwareVerdict.WARN
+            update["reasoning"] = ("GPU build, but the pose model fell back to CPU — "
+                                   "the GPU is not reaching the container.")
         if self._classifier_state == HealthStatus.ERROR:
             from opennvr_adapter_sdk.contract import HardwareVerdict
             update["verdict"] = HardwareVerdict.BLOCKED
@@ -304,6 +336,9 @@ class FallDetectionService(YoloPoseService):
             # Frames in this stream's window. The score is null until it
             # reaches `size` — a new stream is blind for that long.
             "window": {"filled": window.filled if window else 0, "size": TIMESTEPS},
+            # Where the pose model ran ("cuda" / "cpu"), so the app — and
+            # its /state — can show it without a trip to the adapter.
+            "device": self.device,
             "stateful": window is not None,
         }
         return InferResponse(
@@ -340,6 +375,33 @@ class FallDetectionService(YoloPoseService):
             self._interpreter.invoke()
             out = self._interpreter.get_tensor(self._output_index)
         return float(out.reshape(-1)[0])
+
+
+def _cuda_build() -> bool:
+    try:
+        import onnxruntime as ort
+
+        return "CUDAExecutionProvider" in ort.get_available_providers()
+    except Exception:
+        return False
+
+
+def _prepare_cuda() -> bool:
+    """On the GPU build, load the CUDA/cuDNN libraries that ship as pip
+    wheels (``onnxruntime-gpu[cuda,cudnn]``). They are not on the loader
+    path, and without this the CUDA provider cannot start and the session
+    quietly runs on CPU. Returns whether this is the GPU build."""
+    if not _cuda_build():
+        return False
+    import onnxruntime as ort
+
+    preload = getattr(ort, "preload_dlls", None)
+    if preload is not None:
+        try:
+            preload()
+        except Exception:
+            logger.warning("could not preload the CUDA libraries", exc_info=True)
+    return True
 
 
 def _zeros_batch():
