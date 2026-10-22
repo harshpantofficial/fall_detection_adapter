@@ -22,7 +22,7 @@ services:
   fall-detection-adapter:
     build:
       args:
-        ORT_PACKAGE: "onnxruntime-gpu[cuda,cudnn]==1.23.2"
+        ORT_GPU_PACKAGE: "onnxruntime-gpu[cuda,cudnn]==1.23.2"
     image: ${FALL_DETECTION_ADAPTER_GPU_IMAGE:-opennvr/fall-detection-adapter:gpu}
     deploy:
       resources:
